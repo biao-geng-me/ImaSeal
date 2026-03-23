@@ -20,8 +20,8 @@ Controls:
   - Right trigger: speed command (0 to max speed)
 - Keyboard fallback:
   - Space: pause/resume
-  - Page Up: accelerate
-  - Page Down: brake
+  - Page Up / X: accelerate
+  - Page Down / Z: brake
 	- Arrow keys: turn heading by 15 deg toward key direction (minimal-turn)
 	- F1: show help window
 	- W: toggle base whisker layer (original mesh/whiskers)
@@ -87,7 +87,7 @@ class InputProvider(Protocol):
 class KeyboardInput:
 	"""Throttle-and-direction keyboard control.
 
-	Page Up increases throttle, Page Down decreases throttle.
+	Page Up / X increases throttle, Page Down / Z decreases throttle.
 	Arrow keys rotate direction in 15 degree increments toward the key direction.
 	"""
 
@@ -149,9 +149,9 @@ class KeyboardInput:
 
 	def read(self) -> ControllerCommand:
 		throttle_step = self.accel_per_frame / max(self.max_speed, 1e-9)
-		if "pageup" in self.pressed:
+		if "pageup" in self.pressed or "x" in self.pressed:
 			self._throttle = min(1.0, self._throttle + throttle_step)
-		if "pagedown" in self.pressed:
+		if "pagedown" in self.pressed or "z" in self.pressed:
 			self._throttle = max(0.0, self._throttle - throttle_step)
 
 		return ControllerCommand(direction=self._direction.copy(), throttle=self._throttle)
@@ -724,7 +724,7 @@ class SimulationRenderer:
 		self.deflection_quiver = self.ax.quiver(
 			init_centers[:, 0], init_centers[:, 1], _zeros, _zeros,
 			color="tab:red", angles="xy", scale_units="xy", scale=1.0,width=0.003,
-			headwidth=2.4, headlength=3, headaxislength=3,
+			headwidth=1.6, headlength=2, headaxislength=2,
 			zorder=3, animated=True,
 		)
 
@@ -791,7 +791,6 @@ class SimulationRenderer:
 		self.setup()
 		paused = {"value": True}
 		finished = {"value": False, "x_mm": None, "t": None}
-		last_time_label_sec = {"value": -1}
 		flow_visible = {"value": False}
 		traj_visible = {"value": False}
 		base_visible = {"value": True}
@@ -856,7 +855,6 @@ class SimulationRenderer:
 			finished["value"] = False
 			finished["x_mm"] = None
 			finished["t"] = None
-			last_time_label_sec["value"] = -1
 
 			# Update map extent and backdrop artists for the newly loaded flow grid.
 			ext = self.sim.flow.extent()
@@ -875,6 +873,10 @@ class SimulationRenderer:
 			self.bg.set_extent((float(x_img[0]), float(x_img[-1]), float(y_img[0]), float(y_img[-1])))
 			self.bg.set_data(f0.vorticity[::vs, ::vs].T)
 
+			flow_visible["value"] = False
+			self.bg.set_visible(False)
+			traj_visible["value"] = False
+			self.traj_line.set_visible(False)
 			if self.flow_q is not None:
 				self.flow_q.remove()
 				self.flow_q = None
@@ -914,6 +916,36 @@ class SimulationRenderer:
 				self.flow_q.set_visible(flow_visible["value"])
 			_redraw_static_after_toggle()
 
+		def _show_flow_and_traj() -> None:
+			changed = False
+			if not flow_visible["value"]:
+				flow_visible["value"] = True
+				self.bg.set_visible(True)
+				if self.flow_q is not None:
+					self.flow_q.set_visible(True)
+				changed = True
+			if not traj_visible["value"]:
+				traj_visible["value"] = True
+				self.traj_line.set_visible(True)
+				changed = True
+			if changed:
+				_redraw_static_after_toggle()
+
+		def _hide_flow_and_traj() -> None:
+			changed = False
+			if flow_visible["value"]:
+				flow_visible["value"] = False
+				self.bg.set_visible(False)
+				if self.flow_q is not None:
+					self.flow_q.set_visible(False)
+				changed = True
+			if traj_visible["value"]:
+				traj_visible["value"] = False
+				self.traj_line.set_visible(False)
+				changed = True
+			if changed:
+				_redraw_static_after_toggle()
+
 		def _toggle_base_layer() -> None:
 			base_visible["value"] = not base_visible["value"]
 			for ln in self.orig_mesh_lines:
@@ -937,10 +969,10 @@ class SimulationRenderer:
 				"Whisker Simulator Controls\n"
 				"\n"
 				"Movement\n"
-				"  Space      Start/Pause\n"
-				"  Page Up    Accelerate\n"
-				"  Page Down  Brake\n"
-				"  Arrow Keys Turn heading by 15 deg toward key direction\n"
+				"  Space           Start/Pause\n"
+				"  Page Up / X     Accelerate\n"
+				"  Page Down / Z   Brake\n"
+				"  Arrow Keys      Turn heading by 15 deg toward key direction\n"
 				"\n"
 				"Layers\n"
 				"  W  Toggle base whisker layer (original mesh/whiskers)\n"
@@ -992,9 +1024,9 @@ class SimulationRenderer:
 				finished["value"] = False
 				finished["x_mm"] = None
 				finished["t"] = None
-				last_time_label_sec["value"] = -1
 				_set_idle_text()
 				_refresh_preview_pose()
+				_hide_flow_and_traj()
 			if event.key == "tab" and len(self.flow_cases) > 1:
 				next_idx = int(np.random.randint(0, len(self.flow_cases)))
 				if next_idx == self.current_case_idx:
@@ -1041,6 +1073,7 @@ class SimulationRenderer:
 				finished["x_mm"] = x_center * 1000.0
 				finished["t"] = self.sim.time
 				self.sim.state.velocity[:] = 0.0
+				_show_flow_and_traj()
 			if finished["value"]:
 				pos = self.sim.state.position
 				vel = self.sim.state.velocity
@@ -1052,16 +1085,14 @@ class SimulationRenderer:
 				)
 				return self._animated_artists()
 			elapsed_sec = int(self.sim.time)
-			if elapsed_sec != last_time_label_sec["value"]:
-				last_time_label_sec["value"] = elapsed_sec
-				pos = self.sim.state.position
-				vel = self.sim.state.velocity
-				v_mag = float(np.linalg.norm(vel))
-				v_deg = float(np.degrees(np.arctan2(vel[1], vel[0]))) if v_mag > 1e-9 else 0.0
-				self.text.set_text(
-					f"t={elapsed_sec} s | pos=({pos[0]:.3f}, {pos[1]:.3f}) m | "
-					f"vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | F1: Help"
-				)
+			pos = self.sim.state.position
+			vel = self.sim.state.velocity
+			v_mag = float(np.linalg.norm(vel))
+			v_deg = float(np.degrees(np.arctan2(vel[1], vel[0]))) if v_mag > 1e-9 else 0.0
+			self.text.set_text(
+				f"t={elapsed_sec:.1f} s | pos=({pos[0]:.3f}, {pos[1]:.3f}) m | "
+				f"vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | F1: Help"
+			)
 			return self._animated_artists()
 
 		anim = FuncAnimation(
@@ -1147,7 +1178,7 @@ def run_simulation(
 		finish_x=finish_x_mm * 1e-3,
 	)
 	sim = WhiskerArraySimulator(geometry=geometry, flow=flow, config=config, state=state)
-	accel_per_frame = max_accel * dt
+	accel_per_frame = max_accel * dt * 0.25
 	provider, provider_name = _build_input_provider(
 		prefer_gamepad=prefer_gamepad,
 		max_speed=max_speed,
@@ -1186,7 +1217,7 @@ if __name__ == "__main__":
 	parser.add_argument("--cols", type=int, default=3, help="Whisker columns")
 	parser.add_argument("--spacing", type=float, default=0.02, help="Whisker spacing (m)")
 	parser.add_argument("--max-speed", type=float, default=0.2, help="Maximum commanded speed (m/s)")
-	parser.add_argument("--max-accel", type=float, default=0.4, help="Per-axis acceleration limit (m/s^2)")
+	parser.add_argument("--max-accel", type=float, default=0.2, help="Per-axis acceleration limit (m/s^2)")
 	parser.add_argument(
 		"--deflection-gain",
 		type=float,
@@ -1197,7 +1228,7 @@ if __name__ == "__main__":
 	parser.add_argument(
 		"--finish-x-mm",
 		type=float,
-		default=2048.0,
+		default=1920.0,
 		help="Finish line x-position (mm); simulation stops when center reaches it",
 	)
 	parser.add_argument("--traj-path", type=Path, default=None, help="Directory containing *.dat trajectory files (x,y columns in mm)")
