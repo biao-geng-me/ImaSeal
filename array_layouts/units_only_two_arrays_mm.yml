@@ -1,0 +1,26 @@
+# Single-file schema: define reusable local unit arrays first.
+# No instances section -> each unit is used directly as global geometry at center [0, 0].
+units: mm
+ellipse_minor: 6
+major_to_minor_ratio: 2.0
+mesh_knn_k: 2
+
+unit_arrays:
+  diamond9:
+    layout_xy:
+      - [0, 0]
+      - [20, 0]
+      - [-20, 0]
+      - [0, 20]
+      - [0, -20]
+      - [14, 14]
+      - [14, -14]
+      - [-14, 14]
+      - [-14, -14]
+    mesh_knn_k: 3
+
+  line2:
+    layout_xy:
+      - [0, -40]
+      - [0, 40]
+    mesh_knn_k: 1

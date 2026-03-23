@@ -1,0 +1,37 @@
+# Single-file schema: define local unit arrays, then build a larger composed array via instances.
+units: mm
+ellipse_minor: 6
+major_to_minor_ratio: 2.0
+
+unit_arrays:
+  diamond9:
+    layout_xy:
+      - [0, 0]
+      - [20, 0]
+      - [-20, 0]
+      - [0, 20]
+      - [0, -20]
+      - [14, 14]
+      - [14, -14]
+      - [-14, 14]
+      - [-14, -14]
+    mesh_knn_k: 2
+
+instances:
+  - id: left_cluster
+    unit: diamond9
+    center: [-60, 0]
+    heading_deg: 0
+    scale: 1.0
+
+  - id: center_cluster
+    unit: diamond9
+    center: [0, 0]
+    heading_deg: 45
+    scale: 1.0
+
+  - id: right_cluster
+    unit: diamond9
+    center: [60, 0]
+    heading_deg: -30
+    scale: 0.9

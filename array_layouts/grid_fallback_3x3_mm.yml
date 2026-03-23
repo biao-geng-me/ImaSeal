@@ -1,0 +1,6 @@
+# Optional: use YAML but still define a regular grid
+# This demonstrates rows/cols/spacing fallback mode.
+units: mm
+rows: 3
+cols: 3
+spacing: 20

@@ -1,0 +1,18 @@
+# 9-whisker diamond pattern in millimeters
+# mesh_knn_k controls the wireframe connecting the whiskers
+units: mm
+
+layout_xy:
+  - [0, 0]
+  - [20, 0]
+  - [-20, 0]
+  - [0, 20]
+  - [0, -20]
+  - [14, 14]
+  - [14, -14]
+  - [-14, 14]
+  - [-14, -14]
+
+ellipse_minor: 6
+major_to_minor_ratio: 2.0
+mesh_knn_k: 3

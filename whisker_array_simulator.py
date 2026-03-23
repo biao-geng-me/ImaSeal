@@ -65,6 +65,40 @@ else:
 Vec2 = np.ndarray
 
 
+def _build_grid_mesh_edges(rows: int, cols: int) -> list[tuple[int, int]]:
+	edges: list[tuple[int, int]] = []
+
+	def _idx(r: int, c: int) -> int:
+		return r * cols + c
+
+	for r in range(rows):
+		for c in range(cols):
+			if c + 1 < cols:
+				edges.append((_idx(r, c), _idx(r, c + 1)))
+			if r + 1 < rows:
+				edges.append((_idx(r, c), _idx(r + 1, c)))
+	return edges
+
+
+def _build_knn_mesh_edges(layout_xy: np.ndarray, k: int = 2) -> list[tuple[int, int]]:
+	n = int(layout_xy.shape[0])
+	if n <= 1:
+		return []
+	k = int(np.clip(k, 1, max(1, n - 1)))
+	d = layout_xy[:, None, :] - layout_xy[None, :, :]
+	dist = np.linalg.norm(d, axis=2)
+	np.fill_diagonal(dist, np.inf)
+	edges: set[tuple[int, int]] = set()
+	for i in range(n):
+		nn = np.argpartition(dist[i], k)[:k]
+		for j in nn:
+			a = min(i, int(j))
+			b = max(i, int(j))
+			if a != b:
+				edges.add((a, b))
+	return sorted(edges)
+
+
 @dataclass
 class ControllerCommand:
 	"""Normalized control command from pilot input."""
@@ -231,21 +265,225 @@ class WhiskerArrayGeometry:
 		ys = (np.arange(rows) - (rows - 1) * 0.5) * spacing
 		xy = np.array([(x, y) for y in ys for x in xs], dtype=float)
 
-		edges: list[tuple[int, int]] = []
-		def _idx(r: int, c: int) -> int:
-			return r * cols + c
-
-		for r in range(rows):
-			for c in range(cols):
-				if c + 1 < cols:
-					edges.append((_idx(r, c), _idx(r, c + 1)))
-				if r + 1 < rows:
-					edges.append((_idx(r, c), _idx(r + 1, c)))
+		edges = _build_grid_mesh_edges(rows=rows, cols=cols)
 
 		# Ellipse axis ratio 1:2 (minor:major) per spec.
 		minor = 0.006
 		major = minor * 2.0
 		return WhiskerArrayGeometry(layout_xy=xy, ellipse_major=major, ellipse_minor=minor, mesh_edges=edges)
+
+	@staticmethod
+	def from_layout(
+		layout_xy: np.ndarray,
+		*,
+		ellipse_major: float = 0.012,
+		ellipse_minor: float = 0.006,
+		mesh_edges: list[tuple[int, int]] | None = None,
+		mesh_knn_k: int = 2,
+	) -> "WhiskerArrayGeometry":
+		xy = np.asarray(layout_xy, dtype=float)
+		if xy.ndim != 2 or xy.shape[1] != 2:
+			raise ValueError("layout_xy must be an Nx2 numeric array")
+		if xy.shape[0] < 1:
+			raise ValueError("layout_xy must contain at least one point")
+		if not np.all(np.isfinite(xy)):
+			raise ValueError("layout_xy contains non-finite values")
+		if ellipse_major <= 0.0 or ellipse_minor <= 0.0:
+			raise ValueError("ellipse_major and ellipse_minor must be positive")
+
+		n = int(xy.shape[0])
+		if mesh_edges is None:
+			edges = _build_knn_mesh_edges(xy, k=mesh_knn_k)
+		else:
+			edges = []
+			for pair in mesh_edges:
+				if len(pair) != 2:
+					raise ValueError("each mesh edge must contain exactly two indices")
+				i = int(pair[0])
+				j = int(pair[1])
+				if i < 0 or j < 0 or i >= n or j >= n:
+					raise ValueError(f"mesh edge {(i, j)} out of bounds for {n} points")
+				if i != j:
+					edges.append((min(i, j), max(i, j)))
+			edges = sorted(set(edges))
+
+		return WhiskerArrayGeometry(
+			layout_xy=xy,
+			ellipse_major=float(ellipse_major),
+			ellipse_minor=float(ellipse_minor),
+			mesh_edges=edges,
+		)
+
+
+def _load_array_geometry_from_yaml(config_path: str | Path) -> WhiskerArrayGeometry:
+	config_fp = Path(config_path)
+	if not config_fp.is_file():
+		raise ValueError(f"array config file not found: {config_fp}")
+
+	try:
+		import yaml
+	except Exception as exc:
+		raise RuntimeError("PyYAML is required for --array-config. Install with: pip install pyyaml") from exc
+
+	with config_fp.open("r", encoding="utf-8") as fh:
+		data = yaml.safe_load(fh)
+	if not isinstance(data, dict):
+		raise ValueError("array config must be a YAML mapping/object")
+
+	units = str(data.get("units", "m")).strip().lower()
+	if units not in {"m", "mm"}:
+		raise ValueError("array config 'units' must be 'm' or 'mm'")
+	unit_scale = 1e-3 if units == "mm" else 1.0
+
+	def _parse_layout_xy(raw: object) -> np.ndarray:
+		xy = np.asarray(raw, dtype=float)
+		if xy.ndim != 2 or xy.shape[1] != 2:
+			raise ValueError("layout_xy must be an Nx2 numeric array")
+		if xy.shape[0] < 1:
+			raise ValueError("layout_xy must contain at least one point")
+		if not np.all(np.isfinite(xy)):
+			raise ValueError("layout_xy contains non-finite values")
+		return xy * unit_scale
+
+	def _parse_mesh_edges(raw_edges: object, n_pts: int) -> list[tuple[int, int]]:
+		if not isinstance(raw_edges, list):
+			raise ValueError("mesh_edges must be a list of [i, j] pairs")
+		edges: list[tuple[int, int]] = []
+		for edge in raw_edges:
+			if not isinstance(edge, (list, tuple)) or len(edge) != 2:
+				raise ValueError("each mesh edge must contain exactly two indices")
+			i = int(edge[0])
+			j = int(edge[1])
+			if i < 0 or j < 0 or i >= n_pts or j >= n_pts:
+				raise ValueError(f"mesh edge {(i, j)} out of bounds for {n_pts} points")
+			if i != j:
+				edges.append((min(i, j), max(i, j)))
+		return sorted(set(edges))
+
+	def _local_layout_from_cfg(cfg: dict, *, cfg_name: str) -> tuple[np.ndarray, list[tuple[int, int]]]:
+		layout_raw = cfg.get("layout_xy")
+		if layout_raw is not None:
+			xy = _parse_layout_xy(layout_raw)
+		else:
+			rows = cfg.get("rows")
+			cols = cfg.get("cols")
+			spacing = cfg.get("spacing")
+			if rows is None or cols is None or spacing is None:
+				raise ValueError(
+					f"{cfg_name} must define either 'layout_xy' or all of 'rows', 'cols', and 'spacing'"
+				)
+			xy = WhiskerArrayGeometry.regular_grid(
+				rows=int(rows), cols=int(cols), spacing=float(spacing) * unit_scale
+			).layout_xy
+
+		mesh_edges_raw = cfg.get("mesh_edges")
+		if mesh_edges_raw is not None:
+			edges = _parse_mesh_edges(mesh_edges_raw, n_pts=int(xy.shape[0]))
+		else:
+			mesh_knn_k = int(cfg.get("mesh_knn_k", data.get("mesh_knn_k", 2)))
+			edges = _build_knn_mesh_edges(xy, k=mesh_knn_k)
+		return xy, edges
+
+	ellipse_minor = float(data.get("ellipse_minor", 0.006)) * unit_scale
+	if "ellipse_major" in data:
+		ellipse_major = float(data["ellipse_major"]) * unit_scale
+	else:
+		ratio = float(data.get("major_to_minor_ratio", 2.0))
+		if ratio <= 0.0:
+			raise ValueError("major_to_minor_ratio must be positive")
+		ellipse_major = ellipse_minor * ratio
+
+	unit_arrays_raw = data.get("unit_arrays")
+	if unit_arrays_raw is not None:
+		if not isinstance(unit_arrays_raw, dict) or not unit_arrays_raw:
+			raise ValueError("unit_arrays must be a non-empty mapping of unit definitions")
+
+		unit_defs: dict[str, tuple[np.ndarray, list[tuple[int, int]]]] = {}
+		for unit_name, unit_cfg in unit_arrays_raw.items():
+			if not isinstance(unit_cfg, dict):
+				raise ValueError(f"unit_arrays.{unit_name} must be a mapping/object")
+			unit_defs[str(unit_name)] = _local_layout_from_cfg(unit_cfg, cfg_name=f"unit_arrays.{unit_name}")
+
+		instances_raw = data.get("instances")
+		if instances_raw is None:
+			instances = [
+				{"id": name, "unit": name, "center": [0.0, 0.0], "heading_deg": 0.0, "scale": 1.0}
+				for name in unit_defs.keys()
+			]
+		else:
+			if not isinstance(instances_raw, list) or not instances_raw:
+				raise ValueError("instances must be a non-empty list when provided")
+			instances = instances_raw
+
+		all_xy: list[np.ndarray] = []
+		all_edges: list[tuple[int, int]] = []
+		idx_offset = 0
+		for idx, inst in enumerate(instances):
+			if not isinstance(inst, dict):
+				raise ValueError(f"instances[{idx}] must be a mapping/object")
+			unit_name = str(inst.get("unit", "")).strip()
+			if not unit_name:
+				raise ValueError(f"instances[{idx}] missing required 'unit'")
+			if unit_name not in unit_defs:
+				raise ValueError(f"instances[{idx}] references unknown unit '{unit_name}'")
+
+			center_raw = inst.get("center", [0.0, 0.0])
+			center = np.asarray(center_raw, dtype=float)
+			if center.shape != (2,):
+				raise ValueError(f"instances[{idx}].center must be [x, y]")
+			center = center * unit_scale
+
+			heading_deg = float(inst.get("heading_deg", 0.0))
+			theta = np.deg2rad(heading_deg)
+			scale = float(inst.get("scale", 1.0))
+			if scale <= 0.0:
+				raise ValueError(f"instances[{idx}].scale must be positive")
+
+			local_xy, local_edges = unit_defs[unit_name]
+			rot = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]], dtype=float)
+			world_xy = (local_xy * scale) @ rot.T + center
+
+			all_xy.append(world_xy)
+			all_edges.extend((i + idx_offset, j + idx_offset) for i, j in local_edges)
+			idx_offset += int(world_xy.shape[0])
+
+		merged_xy = np.vstack(all_xy)
+		return WhiskerArrayGeometry.from_layout(
+			merged_xy,
+			ellipse_major=ellipse_major,
+			ellipse_minor=ellipse_minor,
+			mesh_edges=all_edges,
+		)
+
+	layout_raw = data.get("layout_xy")
+	if layout_raw is None:
+		rows = data.get("rows")
+		cols = data.get("cols")
+		spacing = data.get("spacing")
+		if rows is None or cols is None or spacing is None:
+			raise ValueError(
+				"array config must define one of: unit_arrays (+ optional instances), layout_xy, or rows/cols/spacing"
+			)
+		return WhiskerArrayGeometry.regular_grid(rows=int(rows), cols=int(cols), spacing=float(spacing) * unit_scale)
+
+	layout_xy = _parse_layout_xy(layout_raw)
+	mesh_edges_raw = data.get("mesh_edges")
+	if mesh_edges_raw is not None:
+		mesh_edges = _parse_mesh_edges(mesh_edges_raw, n_pts=int(layout_xy.shape[0]))
+		return WhiskerArrayGeometry.from_layout(
+			layout_xy,
+			ellipse_major=ellipse_major,
+			ellipse_minor=ellipse_minor,
+			mesh_edges=mesh_edges,
+		)
+
+	mesh_knn_k = int(data.get("mesh_knn_k", 2))
+	return WhiskerArrayGeometry.from_layout(
+		layout_xy,
+		ellipse_major=ellipse_major,
+		ellipse_minor=ellipse_minor,
+		mesh_knn_k=mesh_knn_k,
+	)
 
 
 @dataclass
@@ -1127,6 +1365,7 @@ def _build_input_provider(
 def run_simulation(
 	data_path: str | Path | None = None,
 	*,
+	array_config: str | Path | None = None,
 	data_root: str | Path | None = None,
 	traj_path: str | Path | None = None,
 	exclude_list: str | Path | None = None,
@@ -1163,7 +1402,11 @@ def run_simulation(
 	print(f"[flow] launch case: {initial_case.label} ({initial_case.data_path})")
 
 	flow = FlowFieldSequence.from_last_frame(initial_case.data_path)
-	geometry = WhiskerArrayGeometry.regular_grid(rows=rows, cols=cols, spacing=spacing)
+	if array_config is not None:
+		geometry = _load_array_geometry_from_yaml(array_config)
+		print(f"[array] loaded layout from {Path(array_config)} ({geometry.layout_xy.shape[0]} whiskers)")
+	else:
+		geometry = WhiskerArrayGeometry.regular_grid(rows=rows, cols=cols, spacing=spacing)
 	ext = flow.extent()
 	init_pos = np.array([0.05, float(np.random.uniform(ext[2], ext[3]))], dtype=float)
 	init_vx = float(min(0.03, max_speed * 0.1))
@@ -1216,6 +1459,12 @@ if __name__ == "__main__":
 	parser.add_argument("--rows", type=int, default=3, help="Whisker rows")
 	parser.add_argument("--cols", type=int, default=3, help="Whisker columns")
 	parser.add_argument("--spacing", type=float, default=0.02, help="Whisker spacing (m)")
+	parser.add_argument(
+		"--array-config",
+		type=Path,
+		default=None,
+		help="Single YAML file defining unit_arrays (+ optional instances), or layout_xy/grid params; overrides --rows/--cols/--spacing",
+	)
 	parser.add_argument("--max-speed", type=float, default=0.2, help="Maximum commanded speed (m/s)")
 	parser.add_argument("--max-accel", type=float, default=0.2, help="Per-axis acceleration limit (m/s^2)")
 	parser.add_argument(
@@ -1241,6 +1490,7 @@ if __name__ == "__main__":
 
 	run_simulation(
 		args.data_path,
+		array_config=args.array_config,
 		data_root=args.data_root,
 		traj_path=args.traj_path,
 		exclude_list=args.exclude_list,
