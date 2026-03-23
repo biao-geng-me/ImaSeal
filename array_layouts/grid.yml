@@ -1,0 +1,21 @@
+# Optional: use YAML but still define a regular grid
+# This demonstrates rows/cols/spacing fallback mode.
+units: mm
+unit_arrays:
+  grid:
+    rows: 4
+    cols: 4
+    spacing: 20
+
+instances:
+  - id: left_cluster
+    unit: grid
+    center: [0, 80]
+    heading_deg: 0
+    scale: 1.0
+
+  - id: right_cluster
+    unit: grid
+    center: [0, -80]
+    heading_deg: 0
+    scale: 1.0

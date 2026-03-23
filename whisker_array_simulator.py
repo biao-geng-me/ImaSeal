@@ -22,7 +22,7 @@ Controls:
   - Space: pause/resume
   - Page Up / X: accelerate
   - Page Down / Z: brake
-	- Arrow keys: turn heading by 15 deg toward key direction (minimal-turn)
+	- Arrow keys: turn heading by 5 deg toward key direction (minimal-turn)
 	- F1: show help window
 	- W: toggle base whisker layer (original mesh/whiskers)
 	- D: toggle deflected layer (deflected mesh/whiskers)
@@ -122,12 +122,12 @@ class KeyboardInput:
 	"""Throttle-and-direction keyboard control.
 
 	Page Up / X increases throttle, Page Down / Z decreases throttle.
-	Arrow keys rotate direction in 15 degree increments toward the key direction.
+	Arrow keys rotate direction in 5 degree increments toward the key direction.
 	"""
 
 	max_speed: float = 0.4
 	accel_per_frame: float = 0.008
-	turn_step_deg: float = 15.0
+	turn_step_deg: float = 5.0
 	pressed: set[str] = field(default_factory=set)
 	_direction: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0], dtype=float))
 	_throttle: float = 0.0
@@ -361,6 +361,9 @@ def _load_array_geometry_from_yaml(config_path: str | Path) -> WhiskerArrayGeome
 		return sorted(set(edges))
 
 	def _local_layout_from_cfg(cfg: dict, *, cfg_name: str) -> tuple[np.ndarray, list[tuple[int, int]]]:
+		is_grid_cfg = False
+		grid_rows = 0
+		grid_cols = 0
 		layout_raw = cfg.get("layout_xy")
 		if layout_raw is not None:
 			xy = _parse_layout_xy(layout_raw)
@@ -372,13 +375,18 @@ def _load_array_geometry_from_yaml(config_path: str | Path) -> WhiskerArrayGeome
 				raise ValueError(
 					f"{cfg_name} must define either 'layout_xy' or all of 'rows', 'cols', and 'spacing'"
 				)
+			grid_rows = int(rows)
+			grid_cols = int(cols)
+			is_grid_cfg = True
 			xy = WhiskerArrayGeometry.regular_grid(
-				rows=int(rows), cols=int(cols), spacing=float(spacing) * unit_scale
+				rows=grid_rows, cols=grid_cols, spacing=float(spacing) * unit_scale
 			).layout_xy
 
 		mesh_edges_raw = cfg.get("mesh_edges")
 		if mesh_edges_raw is not None:
 			edges = _parse_mesh_edges(mesh_edges_raw, n_pts=int(xy.shape[0]))
+		elif is_grid_cfg:
+			edges = _build_grid_mesh_edges(rows=grid_rows, cols=grid_cols)
 		else:
 			mesh_knn_k = int(cfg.get("mesh_knn_k", data.get("mesh_knn_k", 2)))
 			edges = _build_knn_mesh_edges(xy, k=mesh_knn_k)
@@ -865,6 +873,7 @@ class SimulationRenderer:
 	vort_step: int = 8  # subsample vorticity imshow for faster rendering
 	flow_cases: list[FlowCase] = field(default_factory=list)
 	current_case_idx: int = 0
+	array_trajectory_txy: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=float), init=False)
 
 	def _build_mesh_lines(self, color: str, lw: float, alpha: float, zorder: int = 2) -> list[Line2D]:
 		lines: list[Line2D] = []
@@ -937,15 +946,21 @@ class SimulationRenderer:
 
 		# Trajectory sits beneath everything else (zorder=1), hidden by default.
 		(self.traj_line,) = self.ax.plot([], [], color="tab:gray", lw=2, alpha=0.5, zorder=1, visible=False)
+		(self.array_center_traj_line,) = self.ax.plot([], [], color="tab:green", lw=1.8, alpha=0.7, zorder=1.1, visible=False)
 		if self.flow_cases:
 			xy = self.flow_cases[self.current_case_idx].traj_xy
 			if xy is not None and xy.size > 0:
 				self.traj_line.set_data(xy[:, 0], xy[:, 1])
 
 		# Layer order: original (zorder=2) → arrows (3) → deflected (4)
-		self.orig_mesh_lines = self._build_mesh_lines(color="tab:blue", lw=1.8, alpha=0.85, zorder=2)
+		self.orig_mesh_lines = self._build_mesh_lines(color="tab:grey", lw=1.8, alpha=0.85, zorder=2)
 
 		n = self.sim.geometry.layout_xy.shape[0]
+		self.whisker_traj_lines: list[Line2D] = []
+		for _ in range(n):
+			(ln_hist,) = self.ax.plot([], [], color="tab:purple", lw=1.0, alpha=0.35, zorder=1.05, visible=False)
+			self.whisker_traj_lines.append(ln_hist)
+
 		self.whisker_orig: list[Ellipse] = []
 		self.whisker_def: list[Ellipse] = []
 		for _ in range(n):
@@ -961,8 +976,8 @@ class SimulationRenderer:
 		_zeros = np.zeros(len(init_centers))
 		self.deflection_quiver = self.ax.quiver(
 			init_centers[:, 0], init_centers[:, 1], _zeros, _zeros,
-			color="tab:red", angles="xy", scale_units="xy", scale=1.0,width=0.003,
-			headwidth=1.6, headlength=2, headaxislength=2,
+			color="tab:red", angles="xy", scale_units="xy", scale=1.0,width=0.002,
+			headwidth=1.4, headlength=1.6, headaxislength=1.6,
 			zorder=3, animated=True,
 		)
 
@@ -1059,8 +1074,57 @@ class SimulationRenderer:
 			zeros = np.zeros(orig.shape[0], dtype=float)
 			self.deflection_quiver.set_UVC(zeros, zeros)
 
+		center_time_hist: list[float] = []
+		center_xy_hist: list[np.ndarray] = []
+		whisker_xy_hist: list[np.ndarray] = []
+
+		def _reset_recorded_trajectory() -> None:
+			center_time_hist.clear()
+			center_xy_hist.clear()
+			whisker_xy_hist.clear()
+
+			pos = self.sim.state.position.copy()
+			orig = self.sim.world_whisker_centers().copy()
+			center_time_hist.append(float(self.sim.time))
+			center_xy_hist.append(np.array([float(pos[0]), float(pos[1])], dtype=float))
+			whisker_xy_hist.append(orig)
+			self.array_trajectory_txy = np.array([[float(self.sim.time), float(pos[0]), float(pos[1])]], dtype=float)
+
+			changed = self.array_center_traj_line.get_visible() or any(ln.get_visible() for ln in self.whisker_traj_lines)
+			self.array_center_traj_line.set_data([], [])
+			self.array_center_traj_line.set_visible(False)
+			for ln in self.whisker_traj_lines:
+				ln.set_data([], [])
+				ln.set_visible(False)
+			if changed:
+				_redraw_static_after_toggle()
+
+		def _append_recorded_trajectory(orig: np.ndarray) -> None:
+			pos = self.sim.state.position
+			center_time_hist.append(float(self.sim.time))
+			center_xy_hist.append(np.array([float(pos[0]), float(pos[1])], dtype=float))
+			whisker_xy_hist.append(orig.copy())
+
+		def _reveal_recorded_trajectory() -> None:
+			if not center_xy_hist:
+				return
+			centers = np.vstack(center_xy_hist)
+			times = np.asarray(center_time_hist, dtype=float)
+			self.array_trajectory_txy = np.column_stack((times, centers))
+
+			self.array_center_traj_line.set_data(centers[:, 0], centers[:, 1])
+			self.array_center_traj_line.set_visible(True)
+
+			if whisker_xy_hist:
+				hist = np.stack(whisker_xy_hist, axis=0)
+				for i, ln in enumerate(self.whisker_traj_lines):
+					ln.set_data(hist[:, i, 0], hist[:, i, 1])
+					ln.set_visible(True)
+			_redraw_static_after_toggle()
+
 		_set_small_initial_velocity()
 		_refresh_preview_pose()
+		_reset_recorded_trajectory()
 		_set_idle_text()
 
 		def _redraw_static_after_toggle() -> None:
@@ -1145,6 +1209,7 @@ class SimulationRenderer:
 
 			_set_idle_text()
 			_refresh_preview_pose()
+			_reset_recorded_trajectory()
 			_redraw_static_after_toggle()
 
 		def _toggle_flow() -> None:
@@ -1210,7 +1275,7 @@ class SimulationRenderer:
 				"  Space           Start/Pause\n"
 				"  Page Up / X     Accelerate\n"
 				"  Page Down / Z   Brake\n"
-				"  Arrow Keys      Turn heading by 15 deg toward key direction\n"
+				"  Arrow Keys      Turn heading by 5 deg toward key direction\n"
 				"\n"
 				"Layers\n"
 				"  W  Toggle base whisker layer (original mesh/whiskers)\n"
@@ -1264,6 +1329,7 @@ class SimulationRenderer:
 				finished["t"] = None
 				_set_idle_text()
 				_refresh_preview_pose()
+				_reset_recorded_trajectory()
 				_hide_flow_and_traj()
 			if event.key == "tab" and len(self.flow_cases) > 1:
 				next_idx = int(np.random.randint(0, len(self.flow_cases)))
@@ -1293,6 +1359,7 @@ class SimulationRenderer:
 			if not finished["value"]:
 				cmd = input_provider.read()
 				orig, deff, _ = self.sim.step(cmd)
+				_append_recorded_trajectory(orig)
 			else:
 				orig = self.sim.world_whisker_centers()
 				deff = orig.copy()
@@ -1311,6 +1378,7 @@ class SimulationRenderer:
 				finished["x_mm"] = x_center * 1000.0
 				finished["t"] = self.sim.time
 				self.sim.state.velocity[:] = 0.0
+				_reveal_recorded_trajectory()
 				_show_flow_and_traj()
 			if finished["value"]:
 				pos = self.sim.state.position
