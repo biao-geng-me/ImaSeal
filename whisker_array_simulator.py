@@ -30,12 +30,15 @@ Controls:
   - R: restart (random y position)
 	- V: toggle flow field (vorticity + quiver)
   - T: toggle trajectory paths
+	- Tab: reset with a new randomly selected flow path
+	- Enter/Return: open flow path selector and reset with chosen path
   - Esc: close
 """
 
 from __future__ import annotations
 
 import importlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -357,6 +360,15 @@ class FlowFieldSequence:
 		return float(f0.x[0]) * s, float(f0.x[-1]) * s, float(f0.y[0]) * s, float(f0.y[-1]) * s
 
 
+@dataclass
+class FlowCase:
+	"""One selectable simulation case: flow path + optional matching trajectory."""
+
+	label: str
+	data_path: Path
+	traj_xy: np.ndarray | None
+
+
 def _rotation_matrix(theta: float) -> np.ndarray:
 	c = float(np.cos(theta))
 	s = float(np.sin(theta))
@@ -442,7 +454,6 @@ def _load_matching_trajectory(
 	For example ``data_path='…/path38'`` looks for ``path_xy38.dat`` inside *traj_path*.
 	Returns an (N, 2) float array in world units (m), or *None* if not found.
 	"""
-	import re
 	m = re.search(r"(\d+)", Path(data_path).name)
 	if m is None:
 		return None
@@ -456,6 +467,156 @@ def _load_matching_trajectory(
 	return None
 
 
+def _numeric_suffix(name: str) -> int | None:
+	"""Return trailing integer from names like 'path38' or None if missing."""
+	m = re.fullmatch(r"[A-Za-z_]+(\d+)", name)
+	if m is None:
+		return None
+	return int(m.group(1))
+
+
+def _load_excluded_path_ids(exclude_file: Path | None) -> set[int]:
+	"""Load excluded path indices from a text file (one integer per line)."""
+	if exclude_file is None or (not exclude_file.is_file()):
+		return set()
+
+	excluded: set[int] = set()
+	for raw in exclude_file.read_text(encoding="utf-8").splitlines():
+		line = raw.strip()
+		if not line or line.startswith("#"):
+			continue
+		try:
+			excluded.add(int(line))
+		except ValueError:
+			print(f"[flow] ignoring invalid exclude entry: {line!r}")
+	return excluded
+
+
+def _discover_numbered_flow_paths(root: Path, excluded_ids: set[int] | None = None) -> list[Path]:
+	"""Find and numerically sort child folders matching path<number> with Q.*.plt files."""
+	if not root.is_dir():
+		return []
+	excluded_ids = excluded_ids if excluded_ids is not None else set()
+	items: list[tuple[int, Path]] = []
+	for child in root.iterdir():
+		if not child.is_dir():
+			continue
+		if not child.name.lower().startswith("path"):
+			continue
+		idx = _numeric_suffix(child.name)
+		if idx is None:
+			continue
+		if idx in excluded_ids:
+			continue
+		if any(child.glob("Q.*.plt")):
+			items.append((idx, child))
+	items.sort(key=lambda it: it[0])
+	return [p for _, p in items]
+
+
+def _choose_flow_index(cases: list[FlowCase], current_idx: int) -> int | None:
+	"""Open a small listbox dialog and return selected case index, or None on cancel."""
+	if not cases:
+		return None
+	try:
+		import tkinter as tk
+	except Exception as exc:
+		print(f"[select] tkinter unavailable ({exc})")
+		return None
+
+	selection: dict[str, int | None] = {"idx": None}
+	root = tk.Tk()
+	root.title("Select flow path")
+	root.resizable(False, False)
+
+	tk.Label(root, text="Choose one flow path and press Select:").pack(padx=10, pady=(10, 4), anchor="w")
+	height = min(24, max(8, len(cases)))
+	listbox = tk.Listbox(root, width=24, height=height, exportselection=False)
+	for case in cases:
+		listbox.insert(tk.END, case.label)
+	listbox.pack(padx=10, pady=4, fill="both", expand=True)
+
+	cur = int(np.clip(current_idx, 0, len(cases) - 1))
+	listbox.selection_set(cur)
+	listbox.see(cur)
+
+	def _confirm(_event=None):
+		sel = listbox.curselection()
+		if sel:
+			selection["idx"] = int(sel[0])
+		root.destroy()
+
+	def _cancel(_event=None):
+		root.destroy()
+
+	btn_row = tk.Frame(root)
+	btn_row.pack(padx=10, pady=(6, 10), fill="x")
+	tk.Button(btn_row, text="Select", width=10, command=_confirm).pack(side="left")
+	tk.Button(btn_row, text="Cancel", width=10, command=_cancel).pack(side="right")
+
+	listbox.bind("<Double-Button-1>", _confirm)
+	root.bind("<Return>", _confirm)
+	root.bind("<Escape>", _cancel)
+	root.protocol("WM_DELETE_WINDOW", _cancel)
+	root.mainloop()
+	return selection["idx"]
+
+
+def _build_flow_cases(
+	data_path: str | Path | None,
+	data_root: str | Path | None,
+	traj_path: str | Path | None,
+	exclude_list: str | Path | None,
+) -> tuple[list[FlowCase], int]:
+	"""Build selectable flow cases and return (cases, initial_index)."""
+	selected_path = Path(data_path) if data_path is not None else None
+
+	# Resolve trajectory directory first: explicit arg wins, otherwise sibling xy_data.
+	traj_dir: Path | None = None
+	if traj_path is not None:
+		cand = Path(traj_path)
+		if cand.is_dir():
+			traj_dir = cand
+
+	if selected_path is not None:
+		if not selected_path.is_dir():
+			raise ValueError(f"data_path does not exist: {selected_path}")
+		parent = selected_path.parent
+		exclude_file = Path(exclude_list) if exclude_list is not None else (parent / "exclude_list.txt")
+		excluded_ids = _load_excluded_path_ids(exclude_file)
+		numbered = _discover_numbered_flow_paths(parent, excluded_ids=excluded_ids)
+		if traj_dir is None:
+			cand = parent / "xy_data"
+			if cand.is_dir():
+				traj_dir = cand
+
+		if numbered and selected_path in numbered:
+			paths = numbered
+			initial_idx = paths.index(selected_path)
+		else:
+			paths = [selected_path]
+			initial_idx = 0
+	else:
+		root = Path(data_root) if data_root is not None else Path("flowdata") / "env1"
+		exclude_file = Path(exclude_list) if exclude_list is not None else (root / "exclude_list.txt")
+		excluded_ids = _load_excluded_path_ids(exclude_file)
+		paths = _discover_numbered_flow_paths(root, excluded_ids=excluded_ids)
+		if not paths:
+			raise ValueError(f"No eligible path<number> directories with Q.*.plt found in {root}")
+		if traj_dir is None:
+			cand = root / "xy_data"
+			if cand.is_dir():
+				traj_dir = cand
+		initial_idx = int(np.random.randint(0, len(paths)))
+
+	cases: list[FlowCase] = []
+	for path in paths:
+		traj_xy = _load_matching_trajectory(path, traj_dir) if traj_dir is not None else None
+		cases.append(FlowCase(label=path.name, data_path=path, traj_xy=traj_xy))
+
+	return cases, initial_idx
+
+
 @dataclass
 class SimulationRenderer:
 	"""Matplotlib renderer for whisker array state and flow backdrop."""
@@ -464,7 +625,8 @@ class SimulationRenderer:
 	show_flow_quiver: bool = True
 	flow_quiver_step: int = 24
 	vort_step: int = 8  # subsample vorticity imshow for faster rendering
-	traj_data: list[np.ndarray] | None = None  # pre-loaded trajectory arrays in world units (m)
+	flow_cases: list[FlowCase] = field(default_factory=list)
+	current_case_idx: int = 0
 
 	def _build_mesh_lines(self, color: str, lw: float, alpha: float, zorder: int = 2) -> list[Line2D]:
 		lines: list[Line2D] = []
@@ -535,12 +697,12 @@ class SimulationRenderer:
 				alpha=0.55,
 			)
 
-		# Trajectories sit beneath everything else (zorder=1), hidden by default.
-		self.traj_lines: list[Line2D] = []
-		if self.traj_data:
-			for xy in self.traj_data:
-				(ln,) = self.ax.plot(xy[:, 0], xy[:, 1], color="tab:gray", lw=2, alpha=0.5, zorder=1, visible=False)
-				self.traj_lines.append(ln)
+		# Trajectory sits beneath everything else (zorder=1), hidden by default.
+		(self.traj_line,) = self.ax.plot([], [], color="tab:gray", lw=2, alpha=0.5, zorder=1, visible=False)
+		if self.flow_cases:
+			xy = self.flow_cases[self.current_case_idx].traj_xy
+			if xy is not None and xy.size > 0:
+				self.traj_line.set_data(xy[:, 0], xy[:, 1])
 
 		# Layer order: original (zorder=2) → arrows (3) → deflected (4)
 		self.orig_mesh_lines = self._build_mesh_lines(color="tab:blue", lw=1.8, alpha=0.85, zorder=2)
@@ -599,7 +761,8 @@ class SimulationRenderer:
 	def _update_flow_background(self, t: float) -> None:
 		idx = self.sim.flow._frame_index(t=t, flow_dt=self.sim.config.flow_dt, loop=self.sim.config.flow_loop)
 		f = self.sim.flow.frames[idx]
-		self.bg.set_data(f.vorticity.T)
+		vs = self.vort_step
+		self.bg.set_data(f.vorticity[::vs, ::vs].T)
 		if self.flow_q is not None:
 			u = f.u[:: self.flow_quiver_step, :: self.flow_quiver_step].T
 			v = f.v[:: self.flow_quiver_step, :: self.flow_quiver_step].T
@@ -629,13 +792,19 @@ class SimulationRenderer:
 		paused = {"value": True}
 		finished = {"value": False, "x_mm": None, "t": None}
 		last_time_label_sec = {"value": -1}
-		flow_visible = {"value": True}
+		flow_visible = {"value": False}
 		traj_visible = {"value": False}
 		base_visible = {"value": True}
 		deflected_visible = {"value": True}
 		arrows_visible = {"value": True}
 		keyboard = input_provider if isinstance(input_provider, KeyboardInput) else None
 		self.text.set_text("Press space to start")
+		self.bg.set_visible(False)
+		if self.flow_q is not None:
+			self.flow_q.set_visible(False)
+
+		def _set_idle_text() -> None:
+			self.text.set_text("Press space to start | F1: Help")
 
 		def _set_small_initial_velocity() -> None:
 			init_vx = float(min(0.1, self.sim.config.max_speed * 0.3))
@@ -655,6 +824,7 @@ class SimulationRenderer:
 
 		_set_small_initial_velocity()
 		_refresh_preview_pose()
+		_set_idle_text()
 
 		def _redraw_static_after_toggle() -> None:
 			# With blit=True, static background is cached; clear it so visibility changes stick.
@@ -666,8 +836,75 @@ class SimulationRenderer:
 
 		def _toggle_traj() -> None:
 			traj_visible["value"] = not traj_visible["value"]
-			for ln in self.traj_lines:
-				ln.set_visible(traj_visible["value"])
+			self.traj_line.set_visible(traj_visible["value"])
+			_redraw_static_after_toggle()
+
+		def _switch_to_case(case_idx: int) -> None:
+			if not self.flow_cases:
+				return
+			case_idx = int(np.clip(case_idx, 0, len(self.flow_cases) - 1))
+			case_changed = case_idx != self.current_case_idx
+			self.current_case_idx = case_idx
+			case = self.flow_cases[self.current_case_idx]
+			if case_changed:
+				self.sim.flow = FlowFieldSequence.from_last_frame(case.data_path)
+			self.sim.reset()
+			if keyboard is not None:
+				keyboard.reset()
+			_set_small_initial_velocity()
+			paused["value"] = True
+			finished["value"] = False
+			finished["x_mm"] = None
+			finished["t"] = None
+			last_time_label_sec["value"] = -1
+
+			# Update map extent and backdrop artists for the newly loaded flow grid.
+			ext = self.sim.flow.extent()
+			self.ax.set_xlim(ext[0], ext[1])
+			self.ax.set_ylim(ext[2], ext[3])
+			xmin, xmax, ymin, ymax = ext
+			dx = xmax - xmin
+			dy = ymax - ymin
+			self.text.set_position((xmin + 0.5 * dx, ymax - 0.015 * dy))
+
+			f0 = self.sim.flow.frames[0]
+			vs = self.vort_step
+			s = self.sim.flow.coord_scale
+			x_img = f0.x[::vs] * s
+			y_img = f0.y[::vs] * s
+			self.bg.set_extent((float(x_img[0]), float(x_img[-1]), float(y_img[0]), float(y_img[-1])))
+			self.bg.set_data(f0.vorticity[::vs, ::vs].T)
+
+			if self.flow_q is not None:
+				self.flow_q.remove()
+				self.flow_q = None
+			if self.show_flow_quiver:
+				xsub = f0.x[:: self.flow_quiver_step] * s
+				ysub = f0.y[:: self.flow_quiver_step] * s
+				u = f0.u[:: self.flow_quiver_step, :: self.flow_quiver_step].T
+				v = f0.v[:: self.flow_quiver_step, :: self.flow_quiver_step].T
+				self.flow_q = self.ax.quiver(
+					xsub,
+					ysub,
+					u,
+					v,
+					color="0.25",
+					angles="xy",
+					scale_units="xy",
+					scale=6.0,
+					width=0.0015,
+					alpha=0.55,
+				)
+				self.flow_q.set_visible(flow_visible["value"])
+
+			xy = case.traj_xy
+			if xy is not None and xy.size > 0:
+				self.traj_line.set_data(xy[:, 0], xy[:, 1])
+			else:
+				self.traj_line.set_data([], [])
+
+			_set_idle_text()
+			_refresh_preview_pose()
 			_redraw_static_after_toggle()
 
 		def _toggle_flow() -> None:
@@ -714,6 +951,8 @@ class SimulationRenderer:
 				"\n"
 				"Session\n"
 				"  R  Reset to pre-start state\n"
+				"  Tab  Reset with randomly selected flow path\n"
+				"  Enter/Return  Open flow selector and reset\n"
 				"  Esc  Close\n"
 			)
 			try:
@@ -754,8 +993,17 @@ class SimulationRenderer:
 				finished["x_mm"] = None
 				finished["t"] = None
 				last_time_label_sec["value"] = -1
-				self.text.set_text("Press space to start")
+				_set_idle_text()
 				_refresh_preview_pose()
+			if event.key == "tab" and len(self.flow_cases) > 1:
+				next_idx = int(np.random.randint(0, len(self.flow_cases)))
+				if next_idx == self.current_case_idx:
+					next_idx = (next_idx + 1) % len(self.flow_cases)
+				_switch_to_case(next_idx)
+			if event.key in ("enter", "return") and len(self.flow_cases) > 0:
+				selected = _choose_flow_index(self.flow_cases, self.current_case_idx)
+				if selected is not None:
+					_switch_to_case(selected)
 			if event.key == "escape":
 				plt.close(self.fig)
 
@@ -800,7 +1048,7 @@ class SimulationRenderer:
 				v_deg = float(np.degrees(np.arctan2(vel[1], vel[0]))) if v_mag > 1e-9 else 0.0
 				self.text.set_text(
 					f"Finished at x={float(finished['x_mm']):.1f} mm, t={float(finished['t']):.2f} s | "
-					f"pos=({pos[0]:.3f}, {pos[1]:.3f}) m | vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | Press R to restart"
+					f"pos=({pos[0]:.3f}, {pos[1]:.3f}) m | vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | Press R to restart | F1: Help"
 				)
 				return self._animated_artists()
 			elapsed_sec = int(self.sim.time)
@@ -811,7 +1059,8 @@ class SimulationRenderer:
 				v_mag = float(np.linalg.norm(vel))
 				v_deg = float(np.degrees(np.arctan2(vel[1], vel[0]))) if v_mag > 1e-9 else 0.0
 				self.text.set_text(
-					f"t={elapsed_sec} s | pos=({pos[0]:.3f}, {pos[1]:.3f}) m | vel={v_mag:.3f} m/s @ {v_deg:.1f} deg"
+					f"t={elapsed_sec} s | pos=({pos[0]:.3f}, {pos[1]:.3f}) m | "
+					f"vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | F1: Help"
 				)
 			return self._animated_artists()
 
@@ -845,9 +1094,11 @@ def _build_input_provider(
 
 
 def run_simulation(
-	data_path: str | Path,
+	data_path: str | Path | None = None,
 	*,
+	data_root: str | Path | None = None,
 	traj_path: str | Path | None = None,
+	exclude_list: str | Path | None = None,
 	dt: float = 0.1,
 	flow_dt: float = 0.04,
 	rows: int = 3,
@@ -869,7 +1120,18 @@ def run_simulation(
 	if finish_x_mm <= 0.0:
 		raise ValueError("finish_x_mm must be positive")
 
-	flow = FlowFieldSequence.from_last_frame(data_path)
+	flow_cases, initial_case_idx = _build_flow_cases(
+		data_path=data_path,
+		data_root=data_root,
+		traj_path=traj_path,
+		exclude_list=exclude_list,
+	)
+	if not flow_cases:
+		raise ValueError("No valid flow cases found")
+	initial_case = flow_cases[initial_case_idx]
+	print(f"[flow] launch case: {initial_case.label} ({initial_case.data_path})")
+
+	flow = FlowFieldSequence.from_last_frame(initial_case.data_path)
 	geometry = WhiskerArrayGeometry.regular_grid(rows=rows, cols=cols, spacing=spacing)
 	ext = flow.extent()
 	init_pos = np.array([0.05, float(np.random.uniform(ext[2], ext[3]))], dtype=float)
@@ -892,15 +1154,7 @@ def run_simulation(
 		accel_per_frame=accel_per_frame,
 	)
 	print(f"[input] using {provider_name}")
-
-	# Auto-detect sibling xy_data directory when no explicit traj_path given.
-	if traj_path is None:
-		candidate = Path(data_path).parent / "xy_data"
-		if candidate.is_dir():
-			traj_path = candidate
-	traj_arr = _load_matching_trajectory(data_path, traj_path) if traj_path is not None else None
-	trajs = [traj_arr] if traj_arr is not None else None
-	renderer = SimulationRenderer(sim=sim, traj_data=trajs)
+	renderer = SimulationRenderer(sim=sim, flow_cases=flow_cases, current_case_idx=initial_case_idx)
 	renderer.animate(provider)
 
 
@@ -908,7 +1162,24 @@ if __name__ == "__main__":
 	import argparse
 
 	parser = argparse.ArgumentParser(description="Interactive whisker-array simulator")
-	parser.add_argument("--data-path", type=Path, required=True, help="Directory containing Q.*.plt files")
+	parser.add_argument(
+		"--data-path",
+		type=Path,
+		default=None,
+		help="Specific directory containing Q.*.plt files (if omitted, pick random from --data-root)",
+	)
+	parser.add_argument(
+		"--data-root",
+		type=Path,
+		default=Path("flowdata") / "env1",
+		help="Root containing path<number> flow folders (default: flowdata/env1)",
+	)
+	parser.add_argument(
+		"--exclude-list",
+		type=Path,
+		default=None,
+		help="Text file listing path indices to exclude (default: <data-root>/exclude_list.txt)",
+	)
 	parser.add_argument("--dt", type=float, default=0.1, help="Simulation time step (s), default 10 Hz")
 	parser.add_argument("--flow-dt", type=float, default=0.04, help="Time spacing of flow frames (s)")
 	parser.add_argument("--rows", type=int, default=3, help="Whisker rows")
@@ -939,7 +1210,9 @@ if __name__ == "__main__":
 
 	run_simulation(
 		args.data_path,
+		data_root=args.data_root,
 		traj_path=args.traj_path,
+		exclude_list=args.exclude_list,
 		dt=args.dt,
 		flow_dt=args.flow_dt,
 		rows=args.rows,
