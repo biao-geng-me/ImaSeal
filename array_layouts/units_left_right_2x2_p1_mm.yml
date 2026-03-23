@@ -1,0 +1,32 @@
+# Single-file schema: define local unit arrays, then build a larger composed array via instances.
+units: mm
+ellipse_minor: 8
+major_to_minor_ratio: 2.0
+
+unit_arrays:
+  two_x_two:
+    layout_xy:
+      - [-10, -10]
+      - [10, -10]
+      - [-10, 10]
+      - [10, 10]
+    mesh_knn_k: 2
+  single:
+    layout_xy:
+      - [0, 0]
+
+instances:
+  - id: left_cluster
+    unit: two_x_two
+    center: [0, 80]
+    heading_deg: 0
+    scale: 1.0
+  - id: center_single
+    unit: single
+    center: [0, 0]
+    scale: 1.0
+  - id: right_cluster
+    unit: two_x_two
+    center: [0, -80]
+    heading_deg: 0
+    scale: 1.0
