@@ -6,8 +6,8 @@ Core behavior:
 2) The array is piloted by gamepad left-stick direction and right-trigger speed.
 3) Commanded velocity is acceleration-limited in x and y.
 4) Body heading updates instantly to face forward (zero angle-of-attack assumption).
-5) Each whisker senses local relative flow (flow velocity minus body velocity).
-6) Deflection is proportional to relative flow and shown as displaced whisker centers.
+5) Each whisker senses local flow velocity.
+6) Deflection is proportional to local flow velocity and shown as displaced whisker centers.
 
 The visualization shows:
 - Original and deflected whisker ellipses.
@@ -678,16 +678,15 @@ class WhiskerArraySimulator:
 			flow_dt=self.config.flow_dt,
 			loop=self.config.flow_loop,
 		)
-		rel_vel = flow_vel - self.state.velocity
 
-		deflection = rel_vel * self.config.deflection_gain
+		deflection = flow_vel * self.config.deflection_gain
 		def_mag = np.linalg.norm(deflection, axis=1)
 		mask = def_mag > self.config.max_deflection
 		if np.any(mask):
 			deflection[mask] *= (self.config.max_deflection / def_mag[mask])[:, None]
 
 		deflected_centers = orig_centers + deflection
-		return orig_centers, deflected_centers, rel_vel
+		return orig_centers, deflected_centers, flow_vel
 
 
 def _load_matching_trajectory(
@@ -945,7 +944,7 @@ class SimulationRenderer:
 			)
 
 		# Trajectory sits beneath everything else (zorder=1), hidden by default.
-		(self.traj_line,) = self.ax.plot([], [], color="tab:gray", lw=2, alpha=0.5, zorder=1, visible=False)
+		(self.traj_line,) = self.ax.plot([], [], color="tab:red", lw=4, alpha=0.5, zorder=1, visible=False)
 		(self.array_center_traj_line,) = self.ax.plot([], [], color="tab:green", lw=1.8, alpha=0.7, zorder=1.1, visible=False)
 		if self.flow_cases:
 			xy = self.flow_cases[self.current_case_idx].traj_xy
@@ -1539,7 +1538,7 @@ if __name__ == "__main__":
 		"--deflection-gain",
 		type=float,
 		default=0.2,
-		help="Deflection gain (m per m/s of relative flow)",
+		help="Deflection gain (m per m/s of local flow velocity)",
 	)
 	parser.add_argument("--max-deflection", type=float, default=0.2, help="Maximum whisker tip displacement (m)")
 	parser.add_argument(

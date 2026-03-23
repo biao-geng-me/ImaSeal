@@ -3,9 +3,9 @@
 units: mm
 unit_arrays:
   grid:
-    rows: 4
-    cols: 4
-    spacing: 20
+    rows: 2
+    cols: 2
+    spacing: 30
 
 instances:
   - id: left_cluster
