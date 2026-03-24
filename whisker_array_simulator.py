@@ -42,6 +42,7 @@ import importlib.util
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Protocol
 
 import matplotlib.pyplot as plt
@@ -64,6 +65,80 @@ else:
 
 
 Vec2 = np.ndarray
+
+
+@dataclass
+class TimingSummary:
+	"""Aggregate timing statistics for one labeled code region."""
+
+	total: float = 0.0
+	count: int = 0
+	minimum: float = float("inf")
+	maximum: float = 0.0
+
+	def add(self, dt: float) -> None:
+		self.total += dt
+		self.count += 1
+		self.minimum = min(self.minimum, dt)
+		self.maximum = max(self.maximum, dt)
+
+	@property
+	def mean(self) -> float:
+		return self.total / self.count if self.count > 0 else 0.0
+
+
+@dataclass
+class StepProfiler:
+	"""Collect labeled timing statistics across simulation steps."""
+
+	stats: dict[str, TimingSummary] = field(default_factory=dict)
+
+	def record(self, label: str, dt: float) -> None:
+		self.stats.setdefault(label, TimingSummary()).add(float(dt))
+
+	def report(self, header: str = "[profile]") -> str:
+		lines = [header]
+		for label in sorted(self.stats.keys()):
+			item = self.stats[label]
+			lines.append(
+				f"  {label:<24} total={item.total * 1e3:9.3f} ms | "
+				f"mean={item.mean * 1e3:8.3f} ms | "
+				f"min={item.minimum * 1e3:8.3f} ms | "
+				f"max={item.maximum * 1e3:8.3f} ms | n={item.count}"
+			)
+
+		# Tick residual = time in _tick not covered by explicitly timed blocks.
+		# This is NOT pure matplotlib draw/blit time.
+		if "tick_total" in self.stats:
+			tick_stat = self.stats["tick_total"]
+			top_level_labels = (
+				"control_read",
+				"simulation_step_total",
+				"trajectory_record",
+				"render_flow_update",
+				"render_mesh_update",
+				"render_shape_update",
+				"render_arrow_update",
+				"text_update",
+			)
+			measured_total = 0.0
+			for label in top_level_labels:
+				item = self.stats.get(label)
+				if item is not None:
+					measured_total += item.total
+			residual_total = max(0.0, tick_stat.total - measured_total)
+			if tick_stat.count > 0:
+				lines.append("")
+				lines.append("  [tick breakdown]")
+				lines.append(
+					f"  {'tick_unprofiled_residual':<24} total={residual_total * 1e3:9.3f} ms | "
+					f"mean={residual_total / tick_stat.count * 1e3:8.3f} ms | "
+					f"n={tick_stat.count}"
+				)
+		return "\n".join(lines)
+
+	def print_report(self, header: str = "[profile]") -> None:
+		print(self.report(header=header))
 
 
 def _build_grid_mesh_edges(rows: int, cols: int) -> list[tuple[int, int]]:
@@ -514,7 +589,7 @@ class SimulatorConfig:
 	max_deflection: float = 0.03
 	dt: float = 0.1
 	flow_dt: float = 0.04
-	flow_loop: bool = True
+	flow_time_delay: float = 0.0
 	finish_x: float = 2.0  # meters (default 2000 mm)
 
 
@@ -529,6 +604,7 @@ class FlowFieldSequence:
 
 	frames: list[FlowFrame2D]
 	coord_scale: float = 1e-3  # flow grid mm → simulator m
+	decay_half_life: float = 0.0  # 0 = no decay; >0 = half-life in seconds for flow past last real frame
 
 	@staticmethod
 	def from_last_frame(data_path: str | Path, coord_scale: float = 1e-3) -> "FlowFieldSequence":
@@ -552,27 +628,132 @@ class FlowFieldSequence:
 		return FlowFieldSequence(frames=[frame], coord_scale=coord_scale)
 
 	@staticmethod
-	def from_path(data_path: str | Path, coord_scale: float = 1e-3) -> "FlowFieldSequence":
+	def from_path(
+		data_path: str | Path,
+		coord_scale: float = 1e-3,
+		*,
+		flow_dt: float = 0.04,
+		decay_half_life: float = 0.0,
+	) -> "FlowFieldSequence":
+		if flow_dt <= 0.0:
+			raise ValueError("flow_dt must be positive")
+		if decay_half_life < 0.0:
+			raise ValueError("decay_half_life must be >= 0")
+
 		frames = load_flow_frames(data_path)
 		if not frames:
 			raise ValueError("No flow frames found")
-		return FlowFieldSequence(frames=frames, coord_scale=coord_scale)
 
-	def _frame_index(self, t: float, flow_dt: float, loop: bool) -> int:
+		return FlowFieldSequence(frames=frames, coord_scale=coord_scale, decay_half_life=decay_half_life)
+
+	def _frame_index(self, t: float, flow_dt: float) -> int:
 		n = len(self.frames)
 		idx = int(np.floor(t / flow_dt))
-		if loop:
-			return idx % n
 		return min(max(idx, 0), n - 1)
 
-	def sample_velocity(self, world_xy: np.ndarray, t: float, flow_dt: float, loop: bool) -> np.ndarray:
-		frame = self.frames[self._frame_index(t=t, flow_dt=flow_dt, loop=loop)]
-		x = frame.x
-		y = frame.y
-		u_grid = frame.u
-		v_grid = frame.v
+	def _frame_blend_indices(self, t: float, flow_dt: float) -> tuple[int, int, float]:
+		n = len(self.frames)
+		if n <= 1:
+			return 0, 0, 0.0
+		if flow_dt <= 0.0:
+			raise ValueError("flow_dt must be positive")
 
-		# world_xy is in simulator units (m); x/y grid is in flow data units (mm).
+		phase = t / flow_dt
+		if phase <= 0.0:
+			return 0, 0, 0.0
+		if phase >= (n - 1):
+			return n - 1, n - 1, 0.0
+
+		i0 = int(np.floor(phase))
+		i1 = i0 + 1
+		alpha = float(phase - i0)
+		return i0, i1, alpha
+
+	def _decay_factor(self, t: float, flow_dt: float) -> float:
+		n = len(self.frames)
+		if self.decay_half_life <= 0.0 or n <= 0:
+			return 1.0
+		t_end = (n - 1) * flow_dt
+		if t <= t_end:
+			return 1.0
+		return float(0.5 ** (float(t - t_end) / self.decay_half_life))
+
+	def frame_signature(self, t: float, flow_dt: float) -> tuple[int, float]:
+		"""Return (frame_idx, 1.0) normally, or (n-1, -1.0) as stable sentinel during decay."""
+		if self._decay_factor(t=t, flow_dt=flow_dt) < 1.0:
+			return len(self.frames) - 1, -1.0
+		return self._frame_index(t=t, flow_dt=flow_dt), 1.0
+
+	def _sample_grid_uv(self, t: float, flow_dt: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+		n = len(self.frames)
+		if self.decay_half_life > 0.0 and n > 0:
+			t_end = (n - 1) * flow_dt
+			if t > t_end:
+				decay_factor = float(0.5 ** (float(t - t_end) / self.decay_half_life))
+				f = self.frames[-1]
+				u = f.u * decay_factor
+				v = f.v * decay_factor
+				w = _compute_vorticity(f.x, f.y, u, v)
+				return u, v, w
+		i0, i1, alpha = self._frame_blend_indices(t=t, flow_dt=flow_dt)
+		f0 = self.frames[i0]
+		f1 = self.frames[i1]
+		if i0 == i1 or alpha <= 0.0:
+			return f0.u, f0.v, f0.vorticity
+		u = (1.0 - alpha) * f0.u + alpha * f1.u
+		v = (1.0 - alpha) * f0.v + alpha * f1.v
+		w = _compute_vorticity(f0.x, f0.y, u, v)
+		return u, v, w
+
+	def _sample_grid_uv_with_profiler(
+		self, t: float, flow_dt: float, profiler: StepProfiler | None
+	) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+		"""Sample flow grid with optional step-by-step profiling of vorticity computation."""
+		n = len(self.frames)
+		if self.decay_half_life > 0.0 and n > 0:
+			t_end = (n - 1) * flow_dt
+			if t > t_end:
+				decay_factor = float(0.5 ** (float(t - t_end) / self.decay_half_life))
+				f = self.frames[-1]
+				u = f.u * decay_factor
+				v = f.v * decay_factor
+				vort_start = perf_counter()
+				w = _compute_vorticity(f.x, f.y, u, v)
+				if profiler is not None:
+					profiler.record("flow_vorticity_compute", perf_counter() - vort_start)
+				return u, v, w
+
+		interp_start = perf_counter()
+		i0, i1, alpha = self._frame_blend_indices(t=t, flow_dt=flow_dt)
+		f0 = self.frames[i0]
+		f1 = self.frames[i1]
+		if i0 == i1 or alpha <= 0.0:
+			if profiler is not None:
+				profiler.record("flow_grid_interp", perf_counter() - interp_start)
+			return f0.u, f0.v, f0.vorticity
+		u = (1.0 - alpha) * f0.u + alpha * f1.u
+		v = (1.0 - alpha) * f0.v + alpha * f1.v
+		if profiler is not None:
+			profiler.record("flow_grid_interp", perf_counter() - interp_start)
+
+		vort_start = perf_counter()
+		w = _compute_vorticity(f0.x, f0.y, u, v)
+		if profiler is not None:
+			profiler.record("flow_vorticity_compute", perf_counter() - vort_start)
+		return u, v, w
+
+	def sample_frame(self, t: float, flow_dt: float) -> FlowFrame2D:
+		"""Return the current raw frame (clamped to last when data ends; no decay applied)."""
+		idx, _ = self.frame_signature(t=t, flow_dt=flow_dt)
+		return self.frames[idx]
+
+	def _fractional_indices_from_world(
+		self,
+		world_xy: np.ndarray,
+		x: np.ndarray,
+		y: np.ndarray,
+	) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+		"""Convert world coordinates (m) to fractional grid indices and bilinear weights."""
 		inv = 1.0 / self.coord_scale
 		xi = np.interp(world_xy[:, 0] * inv, x, np.arange(x.size))
 		yi = np.interp(world_xy[:, 1] * inv, y, np.arange(y.size))
@@ -584,6 +765,15 @@ class FlowFieldSequence:
 
 		sx = xi - x0
 		sy = yi - y0
+		return xi, yi, x0, x1, y0, y1, sx, sy
+
+	def sample_velocity_from_frame(self, world_xy: np.ndarray, frame: FlowFrame2D) -> np.ndarray:
+		x = frame.x
+		y = frame.y
+		u_grid = frame.u
+		v_grid = frame.v
+
+		_, _, x0, x1, y0, y1, sx, sy = self._fractional_indices_from_world(world_xy, x=x, y=y)
 
 		u00 = u_grid[x0, y0]
 		u10 = u_grid[x1, y0]
@@ -599,6 +789,59 @@ class FlowFieldSequence:
 		v = (1 - sx) * (1 - sy) * v00 + sx * (1 - sy) * v10 + (1 - sx) * sy * v01 + sx * sy * v11
 
 		return np.column_stack([u, v])
+
+	def _sample_velocity_from_indices(
+		self,
+		frame: FlowFrame2D,
+		x0: np.ndarray,
+		x1: np.ndarray,
+		y0: np.ndarray,
+		y1: np.ndarray,
+		sx: np.ndarray,
+		sy: np.ndarray,
+	) -> np.ndarray:
+		u_grid = frame.u
+		v_grid = frame.v
+
+		u00 = u_grid[x0, y0]
+		u10 = u_grid[x1, y0]
+		u01 = u_grid[x0, y1]
+		u11 = u_grid[x1, y1]
+
+		v00 = v_grid[x0, y0]
+		v10 = v_grid[x1, y0]
+		v01 = v_grid[x0, y1]
+		v11 = v_grid[x1, y1]
+
+		u = (1 - sx) * (1 - sy) * u00 + sx * (1 - sy) * u10 + (1 - sx) * sy * u01 + sx * sy * u11
+		v = (1 - sx) * (1 - sy) * v00 + sx * (1 - sy) * v10 + (1 - sx) * sy * v01 + sx * sy * v11
+		return np.column_stack([u, v])
+
+	def sample_velocity(self, world_xy: np.ndarray, t: float, flow_dt: float) -> np.ndarray:
+		# Temporal interpolation applied only to sampled whisker points (not the full grid).
+		x = self.frames[0].x
+		y = self.frames[0].y
+		_, _, x0, x1, y0, y1, sx, sy = self._fractional_indices_from_world(world_xy, x=x, y=y)
+
+		decay = self._decay_factor(t=t, flow_dt=flow_dt)
+		if decay < 1.0:
+			v_last = self._sample_velocity_from_indices(self.frames[-1], x0, x1, y0, y1, sx, sy)
+			return v_last * decay
+
+		i0, i1, alpha = self._frame_blend_indices(t=t, flow_dt=flow_dt)
+		f0 = self.frames[i0]
+		if i0 == i1 or alpha <= 0.0:
+			return self._sample_velocity_from_indices(f0, x0, x1, y0, y1, sx, sy)
+
+		f1 = self.frames[i1]
+		v0 = self._sample_velocity_from_indices(f0, x0, x1, y0, y1, sx, sy)
+		v1 = self._sample_velocity_from_indices(f1, x0, x1, y0, y1, sx, sy)
+		return (1.0 - alpha) * v0 + alpha * v1
+
+	def sample_background(self, t: float, flow_dt: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+		"""Return (u, v, vorticity) grids at time t (clamped; no decay applied)."""
+		frame = self.sample_frame(t=t, flow_dt=flow_dt)
+		return frame.u, frame.v, frame.vorticity
 
 	def extent(self) -> tuple[float, float, float, float]:
 		"""Return (xmin, xmax, ymin, ymax) in simulator units (m)."""
@@ -631,6 +874,9 @@ class WhiskerArraySimulator:
 	config: SimulatorConfig
 	state: ArrayState
 	time: float = 0.0
+	current_flow_frame: FlowFrame2D | None = None
+	current_flow_signature: tuple[int, float] | None = None
+	profiler: StepProfiler | None = None
 
 	start_x: float = 0.05  # spawn x in simulator units (m); 50 mm default
 
@@ -647,6 +893,36 @@ class WhiskerArraySimulator:
 		"""Restart simulation: random y at start_x, zero velocity."""
 		self.state = self._random_start_state()
 		self.time = 0.0
+		self.current_flow_frame = None
+		self.current_flow_signature = None
+
+	def _flow_sample_time(self) -> float:
+		return self.time + self.config.flow_time_delay
+
+	def _record_profile(self, label: str, start_time: float) -> None:
+		if self.profiler is not None:
+			self.profiler.record(label, perf_counter() - start_time)
+
+	def _update_current_flow_frame(self) -> FlowFrame2D:
+		started = perf_counter()
+		t_sample = self._flow_sample_time()
+		signature = self.flow.frame_signature(t=t_sample, flow_dt=self.config.flow_dt)
+		if self.current_flow_frame is not None and self.current_flow_signature == signature:
+			self._record_profile("flow_frame_update", started)
+			return self.current_flow_frame
+
+		self.current_flow_frame = self.flow.sample_frame(
+			t=t_sample,
+			flow_dt=self.config.flow_dt,
+		)
+		self.current_flow_signature = signature
+		self._record_profile("flow_frame_update", started)
+		return self.current_flow_frame
+
+	def _get_current_flow_frame(self) -> FlowFrame2D:
+		if self.current_flow_frame is None:
+			return self._update_current_flow_frame()
+		return self.current_flow_frame
 
 	def world_whisker_centers(self) -> np.ndarray:
 		rot = _rotation_matrix(self.state.heading)
@@ -659,13 +935,15 @@ class WhiskerArraySimulator:
 		self.state.velocity = self.state.velocity + dv
 
 	def _sample_deflected_centers(self, orig_centers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+		sample_started = perf_counter()
 		flow_vel = self.flow.sample_velocity(
 			orig_centers,
-			t=self.time,
+			t=self._flow_sample_time(),
 			flow_dt=self.config.flow_dt,
-			loop=self.config.flow_loop,
 		)
+		self._record_profile("whisker_sample", sample_started)
 
+		deflect_started = perf_counter()
 		deflection = flow_vel * self.config.deflection_gain
 		def_mag = np.linalg.norm(deflection, axis=1)
 		mask = def_mag > self.config.max_deflection
@@ -673,9 +951,12 @@ class WhiskerArraySimulator:
 			deflection[mask] *= (self.config.max_deflection / def_mag[mask])[:, None]
 
 		deflected_centers = orig_centers + deflection
+		self._record_profile("deflection_compute", deflect_started)
 		return deflected_centers, flow_vel
 
 	def step(self, command: ControllerCommand) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+		step_started = perf_counter()
+		kinematics_started = perf_counter()
 		target_speed = np.clip(command.throttle, 0.0, 1.0) * self.config.max_speed
 		target_vel = command.direction * target_speed
 		self._apply_accel_limit(target_vel)
@@ -688,13 +969,20 @@ class WhiskerArraySimulator:
 
 		self.state.position = self.state.position + self.state.velocity * self.config.dt
 		self.time += self.config.dt
+		self._record_profile("kinematics_update", kinematics_started)
+		self._update_current_flow_frame()
 
+		center_started = perf_counter()
 		orig_centers = self.world_whisker_centers()
+		self._record_profile("whisker_centers", center_started)
 		deflected_centers, flow_vel = self._sample_deflected_centers(orig_centers)
+		self._record_profile("simulation_step_total", step_started)
 		return orig_centers, deflected_centers, flow_vel
 
 	def step_with_velocity(self, velocity_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 		"""Advance exactly one step using a fixed world-frame velocity command."""
+		step_started = perf_counter()
+		kinematics_started = perf_counter()
 		vel = np.asarray(velocity_xy, dtype=float)
 		if vel.shape != (2,):
 			raise ValueError("velocity_xy must be a 2-vector")
@@ -706,9 +994,14 @@ class WhiskerArraySimulator:
 
 		self.state.position = self.state.position + self.state.velocity * self.config.dt
 		self.time += self.config.dt
+		self._record_profile("kinematics_update", kinematics_started)
+		self._update_current_flow_frame()
 
+		center_started = perf_counter()
 		orig_centers = self.world_whisker_centers()
+		self._record_profile("whisker_centers", center_started)
 		deflected_centers, flow_vel = self._sample_deflected_centers(orig_centers)
+		self._record_profile("simulation_step_total", step_started)
 		return orig_centers, deflected_centers, flow_vel
 
 
@@ -803,10 +1096,11 @@ def _save_headless_animation(
 
 	def _update(frame_idx: int):
 		t, orig, deff, center = sampled_frames[frame_idx]
-		flow_idx = sim.flow._frame_index(t=t, flow_dt=sim.config.flow_dt, loop=sim.config.flow_loop)
+		flow_idx = sim.flow._frame_index(t=t, flow_dt=sim.config.flow_dt)
 		f = sim.flow.frames[flow_idx]
-		bg.set_data(f.vorticity[::vs, ::vs].T)
-		flow_q.set_UVC(f.u[::qstep, ::qstep].T, f.v[::qstep, ::qstep].T)
+		_decay = sim.flow._decay_factor(t, sim.config.flow_dt)
+		bg.set_data(f.vorticity[::vs, ::vs].T * _decay)
+		flow_q.set_UVC(f.u[::qstep, ::qstep].T * _decay, f.v[::qstep, ::qstep].T * _decay)
 		orig_sc.set_offsets(orig)
 		def_sc.set_offsets(deff)
 		center_dot.set_data([float(center[0])], [float(center[1])])
@@ -816,7 +1110,7 @@ def _save_headless_animation(
 				whisker_hist[: frame_idx + 1, whisker_idx, 0],
 				whisker_hist[: frame_idx + 1, whisker_idx, 1],
 			)
-		title.set_text(f"t={t:.2f}s")
+		title.set_text(f"t={t:.1f}s")
 		return (
 			bg,
 			flow_q,
@@ -919,6 +1213,9 @@ def _run_headless_mode(
 		f"[headless] finished at t={sim.time:.3f}s, x={sim.state.position[0]:.3f}m, y={sim.state.position[1]:.3f}m, "
 		f"dt={sim.config.dt:.5f}s ({sample_rate_hz:.1f} Hz)"
 	)
+	if sim.profiler is not None:
+		sim.profiler.print_report(header="[profile] finish-line summary")
+	return
 
 
 def _load_matching_trajectory(
@@ -1104,7 +1401,11 @@ class SimulationRenderer:
 	vort_step: int = 8  # subsample vorticity imshow for faster rendering
 	flow_cases: list[FlowCase] = field(default_factory=list)
 	current_case_idx: int = 0
+	use_dynamic_flow: bool = False
+	flow_decay_half_life: float = 0.0
 	array_trajectory_txy: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=float), init=False)
+	last_flow_signature: tuple[int, float] | None = field(default=None, init=False)
+	_last_decay_visual_t: float = field(default=-1e18, init=False)
 
 	def _build_mesh_lines(self, color: str, lw: float, alpha: float, zorder: int = 2) -> list[Line2D]:
 		lines: list[Line2D] = []
@@ -1154,6 +1455,7 @@ class SimulationRenderer:
 			interpolation="nearest",
 			alpha=0.55,
 		)
+		self.bg.set_animated(True)
 
 		self.flow_q = None
 		if self.show_flow_quiver:
@@ -1174,6 +1476,7 @@ class SimulationRenderer:
 				width=0.0015,
 				alpha=0.55,
 			)
+			self.flow_q.set_animated(True)
 
 		# Trajectory sits beneath everything else (zorder=1), hidden by default.
 		(self.traj_line,) = self.ax.plot([], [], color="tab:red", lw=4, alpha=0.5, zorder=1, visible=False)
@@ -1243,14 +1546,38 @@ class SimulationRenderer:
 			e.set_animated(True)
 
 	def _update_flow_background(self, t: float) -> None:
-		idx = self.sim.flow._frame_index(t=t, flow_dt=self.sim.config.flow_dt, loop=self.sim.config.flow_loop)
-		f = self.sim.flow.frames[idx]
+		t_flow = t + self.sim.config.flow_time_delay
+		decay = self.sim.flow._decay_factor(t_flow, self.sim.config.flow_dt)
 		vs = self.vort_step
-		self.bg.set_data(f.vorticity[::vs, ::vs].T)
+		qs = self.flow_quiver_step
+
+		if decay < 1.0:
+			# Decay period: rate-limit visual updates to 1 FPS; apply decay to subsampled slices.
+			if t - self._last_decay_visual_t < 1.0:
+				return
+			frame = self.sim.flow.frames[-1]
+			self.bg.set_data(frame.vorticity[::vs, ::vs].T * decay)
+			if self.flow_q is not None:
+				self.flow_q.set_UVC(
+					frame.u[::qs, ::qs].T * decay,
+					frame.v[::qs, ::qs].T * decay,
+				)
+			self._last_decay_visual_t = t
+			return
+
+		# Normal period: only update when the discrete frame changes.
+		if abs(t - self.sim.time) <= 1e-12:
+			signature = self.sim.current_flow_signature
+			frame = self.sim._get_current_flow_frame()
+		else:
+			signature = self.sim.flow.frame_signature(t=t_flow, flow_dt=self.sim.config.flow_dt)
+			frame = self.sim.flow.sample_frame(t=t_flow, flow_dt=self.sim.config.flow_dt)
+		if signature is not None and signature == self.last_flow_signature:
+			return
+		self.bg.set_data(frame.vorticity[::vs, ::vs].T)
 		if self.flow_q is not None:
-			u = f.u[:: self.flow_quiver_step, :: self.flow_quiver_step].T
-			v = f.v[:: self.flow_quiver_step, :: self.flow_quiver_step].T
-			self.flow_q.set_UVC(u, v)
+			self.flow_q.set_UVC(frame.u[::qs, ::qs].T, frame.v[::qs, ::qs].T)
+		self.last_flow_signature = signature
 
 	def _update_whisker_shapes(self, orig: np.ndarray, deff: np.ndarray) -> None:
 		angle_deg = np.degrees(self.sim.state.heading)
@@ -1262,14 +1589,18 @@ class SimulationRenderer:
 			e.angle = angle_deg
 
 	def _animated_artists(self) -> tuple:
-		return (
+		artists: list = [
+			self.bg,
 			*self.orig_mesh_lines,
 			*self.def_mesh_lines,
 			*self.whisker_orig,
 			*self.whisker_def,
 			self.deflection_quiver,
 			self.text,
-		)
+		]
+		if self.flow_q is not None:
+			artists.append(self.flow_q)
+		return tuple(artists)
 
 	def animate(self, input_provider: InputProvider) -> None:
 		self.setup()
@@ -1285,6 +1616,7 @@ class SimulationRenderer:
 		self.bg.set_visible(False)
 		if self.flow_q is not None:
 			self.flow_q.set_visible(False)
+		profile_reported = {"value": False}
 
 		def _set_idle_text() -> None:
 			self.text.set_text("Press space to start | F1: Help")
@@ -1379,7 +1711,16 @@ class SimulationRenderer:
 			self.current_case_idx = case_idx
 			case = self.flow_cases[self.current_case_idx]
 			if case_changed:
-				self.sim.flow = FlowFieldSequence.from_last_frame(case.data_path)
+				if self.use_dynamic_flow:
+					self.sim.flow = FlowFieldSequence.from_path(
+						case.data_path,
+						flow_dt=self.sim.config.flow_dt,
+						decay_half_life=self.flow_decay_half_life,
+					)
+				else:
+					self.sim.flow = FlowFieldSequence.from_last_frame(case.data_path)
+				self.last_flow_signature = None
+				self._last_decay_visual_t = -1e18
 			self.sim.reset()
 			if keyboard is not None:
 				keyboard.reset()
@@ -1448,6 +1789,9 @@ class SimulationRenderer:
 			self.bg.set_visible(flow_visible["value"])
 			if self.flow_q is not None:
 				self.flow_q.set_visible(flow_visible["value"])
+			if flow_visible["value"]:
+				self.last_flow_signature = None
+				self._last_decay_visual_t = -1e18
 			_redraw_static_after_toggle()
 
 		def _show_flow_and_traj() -> None:
@@ -1584,24 +1928,49 @@ class SimulationRenderer:
 		interval_ms = max(1, int(round(self.sim.config.dt * 1000.0)))
 
 		def _tick(_frame_idx: int):
+			tick_started = perf_counter()
 			if paused["value"]:
+				if self.sim.profiler is not None:
+					self.sim.profiler.record("tick_total", perf_counter() - tick_started)
 				return self._animated_artists()
 
 			if not finished["value"]:
+				control_started = perf_counter()
 				cmd = input_provider.read()
+				if self.sim.profiler is not None:
+					self.sim.profiler.record("control_read", perf_counter() - control_started)
 				orig, deff, _ = self.sim.step(cmd)
+				traj_started = perf_counter()
 				_append_recorded_trajectory(orig)
+				if self.sim.profiler is not None:
+					self.sim.profiler.record("trajectory_record", perf_counter() - traj_started)
 			else:
 				orig = self.sim.world_whisker_centers()
 				deff = orig.copy()
 
+			if flow_visible["value"]:
+				flow_started = perf_counter()
+				self._update_flow_background(self.sim.time)
+				if self.sim.profiler is not None:
+					self.sim.profiler.record("render_flow_update", perf_counter() - flow_started)
+
+			mesh_started = perf_counter()
 			self._update_mesh_lines(self.orig_mesh_lines, orig)
 			self._update_mesh_lines(self.def_mesh_lines, deff)
-			self._update_whisker_shapes(orig, deff)
+			if self.sim.profiler is not None:
+				self.sim.profiler.record("render_mesh_update", perf_counter() - mesh_started)
 
+			shape_started = perf_counter()
+			self._update_whisker_shapes(orig, deff)
+			if self.sim.profiler is not None:
+				self.sim.profiler.record("render_shape_update", perf_counter() - shape_started)
+
+			arrow_started = perf_counter()
 			delta = deff - orig
 			self.deflection_quiver.set_offsets(orig)
 			self.deflection_quiver.set_UVC(delta[:, 0], delta[:, 1])
+			if self.sim.profiler is not None:
+				self.sim.profiler.record("render_arrow_update", perf_counter() - arrow_started)
 
 			x_center = float(self.sim.state.position[0])
 			if (not finished["value"]) and x_center >= self.sim.config.finish_x:
@@ -1612,6 +1981,7 @@ class SimulationRenderer:
 				_reveal_recorded_trajectory()
 				_show_flow_and_traj()
 			if finished["value"]:
+				text_started = perf_counter()
 				pos = self.sim.state.position
 				vel = self.sim.state.velocity
 				v_mag = float(np.linalg.norm(vel))
@@ -1620,7 +1990,14 @@ class SimulationRenderer:
 					f"Finished at x={float(finished['x_mm']):.1f} mm, t={float(finished['t']):.2f} s | "
 					f"pos=({pos[0]:.3f}, {pos[1]:.3f}) m | vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | Press R to restart | F1: Help"
 				)
+				if self.sim.profiler is not None:
+					self.sim.profiler.record("text_update", perf_counter() - text_started)
+					self.sim.profiler.record("tick_total", perf_counter() - tick_started)
+					if not profile_reported["value"]:
+						self.sim.profiler.print_report(header="[profile] finish-line summary")
+						profile_reported["value"] = True
 				return self._animated_artists()
+			text_started = perf_counter()
 			elapsed_sec = int(self.sim.time)
 			pos = self.sim.state.position
 			vel = self.sim.state.velocity
@@ -1630,6 +2007,9 @@ class SimulationRenderer:
 				f"t={elapsed_sec:.1f} s | pos=({pos[0]:.3f}, {pos[1]:.3f}) m | "
 				f"vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | F1: Help"
 			)
+			if self.sim.profiler is not None:
+				self.sim.profiler.record("text_update", perf_counter() - text_started)
+				self.sim.profiler.record("tick_total", perf_counter() - tick_started)
 			return self._animated_artists()
 
 		anim = FuncAnimation(
@@ -1668,7 +2048,7 @@ def run_simulation(
 	data_root: str | Path | None = None,
 	traj_path: str | Path | None = None,
 	exclude_list: str | Path | None = None,
-	dt: float = 0.1,
+	fps: float = 10.0,
 	flow_dt: float = 0.04,
 	rows: int = 3,
 	cols: int = 3,
@@ -1679,17 +2059,24 @@ def run_simulation(
 	max_deflection: float = 0.03,
 	finish_x_mm: float = 2000.0,
 	prefer_gamepad: bool = True,
+	dynamic_flow: bool = False,
+	flow_decay: float = 0.0,
+	flow_time_delay: float = 0.0,
+	profile_step: bool = False,
 	headless: bool = False,
-	sample_rate_hz: float = 80.0,
 	save_file: str | Path | None = None,
 	save_fps: float = 10.0,
 ) -> None:
 	"""Entry point for whisker-array simulation."""
 
-	if dt <= 0.0:
-		raise ValueError("dt must be positive")
+	if fps <= 0.0:
+		raise ValueError("fps must be positive")
 	if flow_dt <= 0.0:
 		raise ValueError("flow_dt must be positive")
+	if flow_decay < 0.0:
+		raise ValueError("flow_decay must be >= 0")
+	if flow_time_delay < 0.0:
+		raise ValueError("flow_time_delay must be >= 0")
 	if finish_x_mm <= 0.0:
 		raise ValueError("finish_x_mm must be positive")
 
@@ -1702,9 +2089,16 @@ def run_simulation(
 	if not flow_cases:
 		raise ValueError("No valid flow cases found")
 	initial_case = flow_cases[initial_case_idx]
+	if dynamic_flow and data_path is not None:
+		flow_cases = [initial_case]
+		initial_case_idx = 0
 	print(f"[flow] launch case: {initial_case.label} ({initial_case.data_path})")
 
-	flow = FlowFieldSequence.from_last_frame(initial_case.data_path)
+	if dynamic_flow:
+		flow = FlowFieldSequence.from_path(initial_case.data_path, flow_dt=flow_dt, decay_half_life=flow_decay)
+		print(f"[flow] dynamic time series enabled ({len(flow.frames)} real frames)")
+	else:
+		flow = FlowFieldSequence.from_last_frame(initial_case.data_path)
 	if array_config is not None:
 		geometry = _load_array_geometry_from_yaml(array_config)
 		print(f"[array] loaded layout from {Path(array_config)} ({geometry.layout_xy.shape[0]} whiskers)")
@@ -1714,6 +2108,7 @@ def run_simulation(
 	init_pos = np.array([0.05, float(np.random.uniform(ext[2], ext[3]))], dtype=float)
 	init_vx = float(min(0.03, max_speed * 0.1))
 	state = ArrayState(position=init_pos, velocity=np.array([init_vx, 0.0], dtype=float), heading=0.0)
+	dt = 1.0 / fps
 	config = SimulatorConfig(
 		max_speed=max_speed,
 		max_accel=max_accel,
@@ -1721,21 +2116,30 @@ def run_simulation(
 		max_deflection=max_deflection,
 		dt=dt,
 		flow_dt=flow_dt,
+		flow_time_delay=flow_time_delay,
 		finish_x=finish_x_mm * 1e-3,
 	)
-	sim = WhiskerArraySimulator(geometry=geometry, flow=flow, config=config, state=state)
+	sim = WhiskerArraySimulator(
+		geometry=geometry,
+		flow=flow,
+		config=config,
+		state=state,
+		profiler=StepProfiler() if profile_step else None,
+	)
 	if save_file is not None and not headless:
 		print("[headless] --save-file provided; enabling headless mode")
 		headless = True
 
 	if headless:
+		start = perf_counter()
 		_run_headless_mode(
 			sim,
-			sample_rate_hz=sample_rate_hz,
+			sample_rate_hz=fps,
 			save_file=save_file,
 			save_fps=save_fps,
 			object_traj_xy=initial_case.traj_xy,
 		)
+		print(f'Headless mode done in {perf_counter() - start:.3f} s')
 		return
 
 	accel_per_frame = max_accel * dt * 0.25
@@ -1745,7 +2149,13 @@ def run_simulation(
 		accel_per_frame=accel_per_frame,
 	)
 	print(f"[input] using {provider_name}")
-	renderer = SimulationRenderer(sim=sim, flow_cases=flow_cases, current_case_idx=initial_case_idx)
+	renderer = SimulationRenderer(
+		sim=sim,
+		flow_cases=flow_cases,
+		current_case_idx=initial_case_idx,
+		use_dynamic_flow=dynamic_flow,
+		flow_decay_half_life=flow_decay,
+	)
 	renderer.animate(provider)
 
 
@@ -1771,8 +2181,30 @@ if __name__ == "__main__":
 		default=None,
 		help="Text file listing path indices to exclude (default: <data-root>/exclude_list.txt)",
 	)
-	parser.add_argument("--dt", type=float, default=0.1, help="Simulation time step (s), default 10 Hz")
+	parser.add_argument("--fps", type=float, default=10.0, help="Simulation step rate in Hz for both interactive and headless modes (default: 10)")
 	parser.add_argument("--flow-dt", type=float, default=0.04, help="Time spacing of flow frames (s)")
+	parser.add_argument(
+		"--dynamic-flow",
+		action="store_true",
+		help="Load and use all Q.*.plt frames as a time series with temporal interpolation",
+	)
+	parser.add_argument(
+		"--flow-decay",
+		type=float,
+		default=0.0,
+		help="Half-life in seconds for exponential flow decay past the last real frame (0 = no decay, wraps/clamps to last frame)",
+	)
+	parser.add_argument(
+		"--flow-time-delay",
+		type=float,
+		default=0.0,
+		help="Delay (s) before array time maps into flow time for dynamic sampling",
+	)
+	parser.add_argument(
+		"--profile-step",
+		action="store_true",
+		help="Collect timing statistics for simulation-step sub-parts and print them when the run finishes",
+	)
 	parser.add_argument("--rows", type=int, default=3, help="Whisker rows")
 	parser.add_argument("--cols", type=int, default=3, help="Whisker columns")
 	parser.add_argument("--spacing", type=float, default=0.02, help="Whisker spacing (m)")
@@ -1809,12 +2241,6 @@ if __name__ == "__main__":
 		help="Run deterministic non-interactive mode (no live visualization)",
 	)
 	parser.add_argument(
-		"--sample-rate",
-		type=float,
-		default=80.0,
-		help="Headless simulation sample rate in Hz (dt = 1/sample_rate)",
-	)
-	parser.add_argument(
 		"--save-file",
 		type=Path,
 		default=None,
@@ -1834,7 +2260,7 @@ if __name__ == "__main__":
 		data_root=args.data_root,
 		traj_path=args.traj_path,
 		exclude_list=args.exclude_list,
-		dt=args.dt,
+		fps=args.fps,
 		flow_dt=args.flow_dt,
 		rows=args.rows,
 		cols=args.cols,
@@ -1845,8 +2271,11 @@ if __name__ == "__main__":
 		max_deflection=args.max_deflection,
 		finish_x_mm=args.finish_x_mm,
 		prefer_gamepad=not args.keyboard_only,
+		dynamic_flow=args.dynamic_flow,
+		flow_decay=args.flow_decay,
+		flow_time_delay=args.flow_time_delay,
+		profile_step=args.profile_step,
 		headless=args.headless,
-		sample_rate_hz=args.sample_rate,
 		save_file=args.save_file,
 		save_fps=args.save_fps,
 	)
