@@ -118,6 +118,51 @@ def load_flow_frames(data_path: str | Path) -> list[FlowFrame2D]:
 	return frames
 
 
+def _load_trajectory_xy(traj_path: str | Path) -> np.ndarray:
+	"""Load x,y trajectory data from a text file with comma-separated columns."""
+
+	fp = Path(traj_path)
+	if not fp.is_file():
+		raise FileNotFoundError(f"Trajectory file not found: {fp}")
+
+	data = np.loadtxt(fp, delimiter=",")
+	if data.ndim != 2 or data.shape[1] < 2:
+		raise ValueError(f"Trajectory file must contain at least two columns: {fp}")
+	return np.asarray(data[:, :2], dtype=float)
+
+
+def _resolve_trajectory_path(data_path: str | Path, traj_data: str | Path | None) -> Path | None:
+	"""Resolve an explicit or auto-discovered trajectory file for a flow folder."""
+
+	if traj_data is not None:
+		fp = Path(traj_data)
+		if not fp.is_file():
+			raise FileNotFoundError(f"Trajectory file not found: {fp}")
+		return fp
+
+	root = Path(data_path)
+	direct_candidates = []
+	for name in ("xy_path.dat",):
+		fp = root / name
+		if fp.is_file():
+			direct_candidates.append(fp)
+
+	glob_candidates = sorted(root.glob("xy_path*.dat"))
+	seen: set[Path] = set()
+	ordered_candidates: list[Path] = []
+	for fp in direct_candidates + glob_candidates:
+		if fp not in seen:
+			seen.add(fp)
+			ordered_candidates.append(fp)
+
+	if not ordered_candidates:
+		return None
+	if len(ordered_candidates) > 1:
+		names = ", ".join(p.name for p in ordered_candidates)
+		raise ValueError(f"Multiple trajectory files found in {root}; use --traj-data explicitly: {names}")
+	return ordered_candidates[0]
+
+
 def visualize_flow(
 	data_path: str | Path,
 	dt: float,
@@ -126,8 +171,10 @@ def visualize_flow(
 	vort_step: int = 4,
 	autoplay: bool = False,
 	fps: float = 25.0,
-	show_slider: bool = True,
+	show_slider: bool = False,
+	show_colorbar: bool = False,
 	decay: float = 0.0,
+	traj_data: str | Path | None = None,
 ) -> None:
 	"""Interactive quiver plot over vorticity for all Q.*.plt files in a folder."""
 
@@ -146,11 +193,14 @@ def visualize_flow(
 	if not frames:
 		raise ValueError("No frames loaded")
 
+	traj_path = _resolve_trajectory_path(data_path, traj_data)
+	traj_xy = _load_trajectory_xy(traj_path) if traj_path is not None else None
+
 	vmin = -0.1
 	vmax = 0.1
 
 	fig, ax = plt.subplots(figsize=(11, 6))
-	fig.subplots_adjust(bottom=0.18)
+	fig.subplots_adjust(bottom=0.18 if show_slider else 0.1)
 
 	first = frames[0]
 	qstep = quiver_step
@@ -219,7 +269,7 @@ def visualize_flow(
 				frac=frac,
 			)
 			quiver_display.append((uq_adv, vq_adv))
-			frame_names.append(f"decay | t={((n_real - 1 + k) * dt):.4g}")
+			frame_names.append(f"decay | t={((n_real - 1 + k) * dt):.4f} s")
 
 	total_n = len(vort_display)
 
@@ -246,10 +296,23 @@ def visualize_flow(
 		headwidth=1.5,
 		headaxislength=2.0,
 	)
-	fig.colorbar(mesh, ax=ax, label="vorticity")
+	if traj_xy is not None and traj_xy.size > 0:
+		ax.plot(
+			traj_xy[:, 0],
+			traj_xy[:, 1],
+			color="tab:red",
+			lw=2.0,
+			alpha=0.75,
+			zorder=2.5,
+			label="object trajectory",
+		)
+	if show_colorbar:
+		fig.colorbar(mesh, ax=ax, label="vorticity")
 	ax.set_xlabel("x")
 	ax.set_ylabel("y")
 	ax.set_aspect("equal")
+	if traj_xy is not None and traj_xy.size > 0:
+		ax.legend(loc="upper right")
 
 	title = ax.set_title("")
 
@@ -258,7 +321,7 @@ def visualize_flow(
 		uq, vq = quiver_display[idx]
 		qv.set_UVC(uq, vq)
 		time_value = idx * dt
-		title.set_text(f"{frame_names[idx]} | frame={idx + 1}/{total_n} | t={time_value:.6g}")
+		title.set_text(f"{frame_names[idx]} | frame={idx + 1}/{total_n} | t={time_value:.4f} s")
 		if redraw:
 			fig.canvas.draw_idle()
 
@@ -404,6 +467,16 @@ if __name__ == "__main__":
 		help="Subsampling step for vorticity background rendering (default: 8)",
 	)
 	parser.add_argument(
+		"--colorbar",
+		action="store_true",
+		help="Show the vorticity colorbar",
+	)
+	parser.add_argument(
+		"--slider",
+		action="store_true",
+		help="Show the frame slider",
+	)
+	parser.add_argument(
 		"--autoplay",
 		action="store_true",
 		help="Automatically play frames in a loop",
@@ -417,7 +490,7 @@ if __name__ == "__main__":
 	parser.add_argument(
 		"--no-slider",
 		action="store_true",
-		help="Disable frame slider to reduce UI overhead in high-speed playback",
+		help="Deprecated compatibility flag; slider is hidden by default",
 	)
 	parser.add_argument(
 		"--decay",
@@ -425,6 +498,12 @@ if __name__ == "__main__":
 		default=0.0,
 		metavar="MULT",
 		help="Append MULT*N extra frames where velocity decays from the last real frame with half-life = total real duration",
+	)
+	parser.add_argument(
+		"--traj-data",
+		type=Path,
+		default=None,
+		help="Optional trajectory file to overlay (x,y columns). If omitted, auto-load xy_path.dat or a single path_xy*.dat from --data-path",
 	)
 	args = parser.parse_args()
 
@@ -436,6 +515,8 @@ if __name__ == "__main__":
 		vort_step=args.vort_step,
 		autoplay=args.autoplay,
 		fps=args.fps,
-		show_slider=not args.no_slider,
+		show_slider=args.slider and not args.no_slider,
+		show_colorbar=args.colorbar,
 		decay=args.decay,
+		traj_data=args.traj_data,
 	)
