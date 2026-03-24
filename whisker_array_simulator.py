@@ -38,6 +38,7 @@ Controls:
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,7 +46,7 @@ from typing import Protocol
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.animation import FuncAnimation
+from matplotlib.animation import FFMpegWriter, FuncAnimation
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
 
@@ -657,6 +658,23 @@ class WhiskerArraySimulator:
 		dv = np.clip(dv, -max_dv, max_dv)
 		self.state.velocity = self.state.velocity + dv
 
+	def _sample_deflected_centers(self, orig_centers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+		flow_vel = self.flow.sample_velocity(
+			orig_centers,
+			t=self.time,
+			flow_dt=self.config.flow_dt,
+			loop=self.config.flow_loop,
+		)
+
+		deflection = flow_vel * self.config.deflection_gain
+		def_mag = np.linalg.norm(deflection, axis=1)
+		mask = def_mag > self.config.max_deflection
+		if np.any(mask):
+			deflection[mask] *= (self.config.max_deflection / def_mag[mask])[:, None]
+
+		deflected_centers = orig_centers + deflection
+		return deflected_centers, flow_vel
+
 	def step(self, command: ControllerCommand) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 		target_speed = np.clip(command.throttle, 0.0, 1.0) * self.config.max_speed
 		target_vel = command.direction * target_speed
@@ -672,21 +690,235 @@ class WhiskerArraySimulator:
 		self.time += self.config.dt
 
 		orig_centers = self.world_whisker_centers()
-		flow_vel = self.flow.sample_velocity(
-			orig_centers,
-			t=self.time,
-			flow_dt=self.config.flow_dt,
-			loop=self.config.flow_loop,
+		deflected_centers, flow_vel = self._sample_deflected_centers(orig_centers)
+		return orig_centers, deflected_centers, flow_vel
+
+	def step_with_velocity(self, velocity_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+		"""Advance exactly one step using a fixed world-frame velocity command."""
+		vel = np.asarray(velocity_xy, dtype=float)
+		if vel.shape != (2,):
+			raise ValueError("velocity_xy must be a 2-vector")
+
+		speed = float(np.linalg.norm(vel))
+		self.state.velocity = vel
+		if speed > 1e-9:
+			self.state.heading = float(np.arctan2(vel[1], vel[0]))
+
+		self.state.position = self.state.position + self.state.velocity * self.config.dt
+		self.time += self.config.dt
+
+		orig_centers = self.world_whisker_centers()
+		deflected_centers, flow_vel = self._sample_deflected_centers(orig_centers)
+		return orig_centers, deflected_centers, flow_vel
+
+
+def _save_headless_animation(
+	sim: WhiskerArraySimulator,
+	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray]],
+	output_path: str | Path,
+	fps: float,
+	object_traj_xy: np.ndarray | None = None,
+) -> None:
+	"""Save a compact animation of the headless run.
+
+	Each sampled frame tuple is ``(t, orig_centers, deflected_centers, array_center)``.
+	"""
+	if fps <= 0.0:
+		raise ValueError("fps must be positive")
+	if not sampled_frames:
+		raise ValueError("No sampled frames available for export")
+
+	output = Path(output_path)
+	output.parent.mkdir(parents=True, exist_ok=True)
+
+	ext = output.suffix.lower()
+	if ext not in {".mp4", ".m4v", ".mov", ".gif"}:
+		output = output.with_suffix(".mp4")
+		ext = ".mp4"
+
+	fig, ax = plt.subplots(figsize=(6.4, 4.2))
+	extent = sim.flow.extent()
+	ax.set_xlim(extent[0], extent[1])
+	ax.set_ylim(extent[2], extent[3])
+	ax.set_aspect("equal")
+	ax.set_xlabel("x (m)")
+	ax.set_ylabel("y (m)")
+
+	f0 = sim.flow.frames[0]
+	vs = 8
+	qstep = 24
+	s = sim.flow.coord_scale
+	x_img = f0.x[::vs] * s
+	y_img = f0.y[::vs] * s
+	x_q = f0.x[::qstep] * s
+	y_q = f0.y[::qstep] * s
+	bg = ax.imshow(
+		f0.vorticity[::vs, ::vs].T,
+		origin="lower",
+		extent=(float(x_img[0]), float(x_img[-1]), float(y_img[0]), float(y_img[-1])),
+		cmap="RdBu_r",
+		vmin=-0.1,
+		vmax=0.1,
+		interpolation="nearest",
+		alpha=0.5,
+	)
+	flow_q = ax.quiver(
+		x_q,
+		y_q,
+		f0.u[::qstep, ::qstep].T,
+		f0.v[::qstep, ::qstep].T,
+		color="0.25",
+		angles="xy",
+		scale_units="xy",
+		scale=6.0,
+		width=0.0015,
+		alpha=0.55,
+	)
+	finish_line = ax.axvline(sim.config.finish_x, color="tab:red", lw=1.1, ls="--", alpha=0.9)
+	orig_sc = ax.scatter([], [], s=10, facecolors="none", edgecolors="tab:grey", linewidths=0.9)
+	def_sc = ax.scatter([], [], s=10, facecolors="none", edgecolors="tab:orange", linewidths=0.9)
+	(center_dot,) = ax.plot([], [], marker="o", ms=3.0, color="tab:green", lw=0.0)
+	if object_traj_xy is not None and object_traj_xy.size > 0:
+		ax.plot(
+			object_traj_xy[:, 0],
+			object_traj_xy[:, 1],
+			color="tab:red",
+			lw=1.8,
+			alpha=0.7,
+			zorder=2.5,
+			label="object trajectory",
 		)
 
-		deflection = flow_vel * self.config.deflection_gain
-		def_mag = np.linalg.norm(deflection, axis=1)
-		mask = def_mag > self.config.max_deflection
-		if np.any(mask):
-			deflection[mask] *= (self.config.max_deflection / def_mag[mask])[:, None]
+	center_hist = np.vstack([frame[3] for frame in sampled_frames])
+	whisker_hist = np.stack([frame[1] for frame in sampled_frames], axis=0)
+	(center_traj_line,) = ax.plot([], [], color="tab:green", lw=1.6, alpha=0.8, zorder=2.6, label="array center")
+	whisker_traj_lines: list[Line2D] = []
+	for whisker_idx in range(whisker_hist.shape[1]):
+		(ln,) = ax.plot([], [], color="tab:purple", lw=0.9, alpha=0.25, zorder=2.55)
+		whisker_traj_lines.append(ln)
 
-		deflected_centers = orig_centers + deflection
-		return orig_centers, deflected_centers, flow_vel
+	if object_traj_xy is not None and object_traj_xy.size > 0:
+		ax.legend(loc="upper right", fontsize=8)
+	title = ax.set_title("", fontsize=10)
+
+	def _update(frame_idx: int):
+		t, orig, deff, center = sampled_frames[frame_idx]
+		flow_idx = sim.flow._frame_index(t=t, flow_dt=sim.config.flow_dt, loop=sim.config.flow_loop)
+		f = sim.flow.frames[flow_idx]
+		bg.set_data(f.vorticity[::vs, ::vs].T)
+		flow_q.set_UVC(f.u[::qstep, ::qstep].T, f.v[::qstep, ::qstep].T)
+		orig_sc.set_offsets(orig)
+		def_sc.set_offsets(deff)
+		center_dot.set_data([float(center[0])], [float(center[1])])
+		center_traj_line.set_data(center_hist[: frame_idx + 1, 0], center_hist[: frame_idx + 1, 1])
+		for whisker_idx, ln in enumerate(whisker_traj_lines):
+			ln.set_data(
+				whisker_hist[: frame_idx + 1, whisker_idx, 0],
+				whisker_hist[: frame_idx + 1, whisker_idx, 1],
+			)
+		title.set_text(f"t={t:.2f}s")
+		return (
+			bg,
+			flow_q,
+			finish_line,
+			orig_sc,
+			def_sc,
+			center_dot,
+			center_traj_line,
+			*whisker_traj_lines,
+			title,
+		)
+
+	interval_ms = max(1, int(round(1000.0 / fps)))
+	anim = FuncAnimation(
+		fig,
+		_update,
+		frames=len(sampled_frames),
+		interval=interval_ms,
+		blit=False,
+		cache_frame_data=False,
+	)
+
+	if ext == ".gif":
+		anim.save(str(output), writer="pillow", fps=int(round(fps)), dpi=80)
+	else:
+		try:
+			writer = FFMpegWriter(
+				fps=int(round(fps)),
+				codec="libx264",
+				bitrate=600,
+				extra_args=["-preset", "veryfast", "-crf", "32", "-pix_fmt", "yuv420p"],
+			)
+			anim.save(str(output), writer=writer, dpi=90)
+		except Exception:
+			fallback = output.with_suffix(".gif")
+			anim.save(str(fallback), writer="pillow", fps=int(round(fps)), dpi=80)
+			print(f"[headless] ffmpeg unavailable; wrote GIF instead: {fallback}")
+
+	plt.close(fig)
+	print(f"[headless] saved animation: {output}")
+
+
+def _run_headless_mode(
+	sim: WhiskerArraySimulator,
+	*,
+	sample_rate_hz: float = 80.0,
+	save_file: str | Path | None = None,
+	save_fps: float = 10.0,
+	start_xy_m: tuple[float, float] = (0.150, 0.500),
+	constant_speed_mps: float = 0.2,
+	object_traj_xy: np.ndarray | None = None,
+) -> None:
+	"""Deterministic, non-interactive simulation runner for testing and export."""
+	if sample_rate_hz <= 0.0:
+		raise ValueError("sample_rate_hz must be positive")
+	if save_fps <= 0.0:
+		raise ValueError("save_fps must be positive")
+	if constant_speed_mps <= 0.0:
+		raise ValueError("constant_speed_mps must be positive")
+
+	sim.config.dt = 1.0 / sample_rate_hz
+	sim.time = 0.0
+	sim.state.position = np.array([float(start_xy_m[0]), float(start_xy_m[1])], dtype=float)
+	sim.state.velocity = np.array([constant_speed_mps, 0.0], dtype=float)
+	sim.state.heading = 0.0
+
+	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
+	next_save_t = 0.0
+	save_dt = 1.0 / save_fps
+
+	initial_orig = sim.world_whisker_centers()
+	initial_def, _ = sim._sample_deflected_centers(initial_orig)
+	if save_file is not None:
+		sampled_frames.append((sim.time, initial_orig.copy(), initial_def.copy(), sim.state.position.copy()))
+		next_save_t = save_dt
+
+	fixed_vel = np.array([constant_speed_mps, 0.0], dtype=float)
+	while True:
+		orig, deff, _ = sim.step_with_velocity(fixed_vel)
+		if save_file is not None and sim.time + 1e-12 >= next_save_t:
+			sampled_frames.append((sim.time, orig.copy(), deff.copy(), sim.state.position.copy()))
+			next_save_t += save_dt
+
+		if float(sim.state.position[0]) >= sim.config.finish_x:
+			break
+
+	# Ensure final frame is included in export.
+	if save_file is not None:
+		if not sampled_frames or sampled_frames[-1][0] < sim.time - 1e-12:
+			sampled_frames.append((sim.time, orig.copy(), deff.copy(), sim.state.position.copy()))
+		_save_headless_animation(
+			sim,
+			sampled_frames,
+			output_path=save_file,
+			fps=save_fps,
+			object_traj_xy=object_traj_xy,
+		)
+
+	print(
+		f"[headless] finished at t={sim.time:.3f}s, x={sim.state.position[0]:.3f}m, y={sim.state.position[1]:.3f}m, "
+		f"dt={sim.config.dt:.5f}s ({sample_rate_hz:.1f} Hz)"
+	)
 
 
 def _load_matching_trajectory(
@@ -1447,6 +1679,10 @@ def run_simulation(
 	max_deflection: float = 0.03,
 	finish_x_mm: float = 2000.0,
 	prefer_gamepad: bool = True,
+	headless: bool = False,
+	sample_rate_hz: float = 80.0,
+	save_file: str | Path | None = None,
+	save_fps: float = 10.0,
 ) -> None:
 	"""Entry point for whisker-array simulation."""
 
@@ -1488,6 +1724,20 @@ def run_simulation(
 		finish_x=finish_x_mm * 1e-3,
 	)
 	sim = WhiskerArraySimulator(geometry=geometry, flow=flow, config=config, state=state)
+	if save_file is not None and not headless:
+		print("[headless] --save-file provided; enabling headless mode")
+		headless = True
+
+	if headless:
+		_run_headless_mode(
+			sim,
+			sample_rate_hz=sample_rate_hz,
+			save_file=save_file,
+			save_fps=save_fps,
+			object_traj_xy=initial_case.traj_xy,
+		)
+		return
+
 	accel_per_frame = max_accel * dt * 0.25
 	provider, provider_name = _build_input_provider(
 		prefer_gamepad=prefer_gamepad,
@@ -1553,6 +1803,29 @@ if __name__ == "__main__":
 		action="store_true",
 		help="Disable gamepad probing and use keyboard controls only",
 	)
+	parser.add_argument(
+		"--headless",
+		action="store_true",
+		help="Run deterministic non-interactive mode (no live visualization)",
+	)
+	parser.add_argument(
+		"--sample-rate",
+		type=float,
+		default=80.0,
+		help="Headless simulation sample rate in Hz (dt = 1/sample_rate)",
+	)
+	parser.add_argument(
+		"--save-file",
+		type=Path,
+		default=None,
+		help="Optional animation output path in headless mode (.mp4/.m4v/.mov/.gif)",
+	)
+	parser.add_argument(
+		"--save-fps",
+		type=float,
+		default=10.0,
+		help="Output frame rate when saving headless animation (default: 10 FPS)",
+	)
 	args = parser.parse_args()
 
 	run_simulation(
@@ -1572,4 +1845,8 @@ if __name__ == "__main__":
 		max_deflection=args.max_deflection,
 		finish_x_mm=args.finish_x_mm,
 		prefer_gamepad=not args.keyboard_only,
+		headless=args.headless,
+		sample_rate_hz=args.sample_rate,
+		save_file=args.save_file,
+		save_fps=args.save_fps,
 	)
