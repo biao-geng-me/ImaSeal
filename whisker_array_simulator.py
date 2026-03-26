@@ -614,6 +614,7 @@ class FlowFieldSequence:
 		if not files:
 			raise ValueError(f"No Q.*.plt files found in {root}")
 		fp = files[-1]
+		_t0 = perf_counter()
 		parsed = read_plt75(fp)
 		zone = parsed.zones[0]
 		xc = _extract_2d(zone, "xc")
@@ -624,7 +625,7 @@ class FlowFieldSequence:
 		y = np.asarray(yc[0, :], dtype=float)
 		w = _compute_vorticity(x, y, u, v)
 		frame = FlowFrame2D(name=fp.name, x=x, y=y, u=u, v=v, vorticity=w)
-		print(f"[flow] loaded single frame: {fp.name}")
+		print(f"[flow] loaded single frame: {fp.name} ({perf_counter() - _t0:.3f} s)")
 		return FlowFieldSequence(frames=[frame], coord_scale=coord_scale)
 
 	@staticmethod
@@ -640,9 +641,11 @@ class FlowFieldSequence:
 		if decay_half_life < 0.0:
 			raise ValueError("decay_half_life must be >= 0")
 
+		_t0 = perf_counter()
 		frames = load_flow_frames(data_path)
 		if not frames:
 			raise ValueError("No flow frames found")
+		print(f"[flow] loaded {len(frames)} frame(s) from '{data_path}' ({perf_counter() - _t0:.3f} s)")
 
 		return FlowFieldSequence(frames=frames, coord_scale=coord_scale, decay_half_life=decay_half_life)
 
