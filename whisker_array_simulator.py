@@ -1007,7 +1007,7 @@ class WhiskerArraySimulator:
 
 def _save_headless_animation(
 	sim: WhiskerArraySimulator,
-	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray]],
+	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float]],
 	output_path: str | Path,
 	fps: float,
 	object_traj_xy: np.ndarray | None = None,
@@ -1015,7 +1015,7 @@ def _save_headless_animation(
 ) -> None:
 	"""Save a compact animation of the headless run.
 
-	Each sampled frame tuple is ``(t, orig_centers, deflected_centers, array_center)``.
+	Each sampled frame tuple is ``(t, orig_centers, deflected_centers, array_center, heading_rad)``.
 	"""
 	if fps <= 0.0:
 		raise ValueError("fps must be positive")
@@ -1069,9 +1069,53 @@ def _save_headless_animation(
 		alpha=0.55,
 	)
 	finish_line = ax.axvline(sim.config.finish_x, color="tab:red", lw=1.1, ls="--", alpha=0.9)
-	orig_sc = ax.scatter([], [], s=10, facecolors="none", edgecolors="tab:grey", linewidths=0.9)
-	def_sc = ax.scatter([], [], s=10, facecolors="none", edgecolors="tab:orange", linewidths=0.9)
 	(center_dot,) = ax.plot([], [], marker="o", ms=3.0, color="tab:green", lw=0.0)
+	orig_mesh_lines = _create_mesh_lines(
+		ax,
+		sim.geometry.mesh_edges,
+		color="tab:grey",
+		lw=1.5,
+		alpha=0.85,
+		zorder=2,
+	)
+	orig_whiskers: list[Ellipse] = []
+	def_whiskers: list[Ellipse] = []
+	for _ in range(sim.geometry.layout_xy.shape[0]):
+		e_orig = Ellipse((0.0, 0.0), width=sim.geometry.ellipse_major, height=sim.geometry.ellipse_minor)
+		e_orig.set_edgecolor("tab:grey")
+		e_orig.set_facecolor("none")
+		e_orig.set_linewidth(1.2)
+		e_orig.set_zorder(2)
+		ax.add_patch(e_orig)
+		orig_whiskers.append(e_orig)
+
+		e_def = Ellipse((0.0, 0.0), width=sim.geometry.ellipse_major, height=sim.geometry.ellipse_minor)
+		e_def.set_edgecolor("tab:orange")
+		e_def.set_facecolor("none")
+		e_def.set_linewidth(1.0)
+		e_def.set_zorder(4)
+		e_def.set_visible(False)
+		ax.add_patch(e_def)
+		def_whiskers.append(e_def)
+
+	init_orig = sampled_frames[0][1]
+	_zeros = np.zeros(len(init_orig))
+	deflection_quiver = ax.quiver(
+		init_orig[:, 0],
+		init_orig[:, 1],
+		_zeros,
+		_zeros,
+		color="tab:red",
+		angles="xy",
+		scale_units="xy",
+		scale=1.0,
+		width=0.002,
+		headwidth=1.4,
+		headlength=1.6,
+		headaxislength=1.6,
+		zorder=3,
+	)
+
 	if object_traj_xy is not None and object_traj_xy.size > 0:
 		ax.plot(
 			object_traj_xy[:, 0],
@@ -1096,14 +1140,19 @@ def _save_headless_animation(
 	title = ax.set_title("", fontsize=10)
 
 	def _update(frame_idx: int):
-		t, orig, deff, center = sampled_frames[frame_idx]
+		t, orig, deff, center, heading_rad = sampled_frames[frame_idx]
 		flow_idx = sim.flow._frame_index(t=t, flow_dt=sim.config.flow_dt)
 		f = sim.flow.frames[flow_idx]
 		_decay = sim.flow._decay_factor(t, sim.config.flow_dt)
 		bg.set_data(f.vorticity[::vs, ::vs].T * _decay)
 		flow_q.set_UVC(f.u[::qstep, ::qstep].T * _decay, f.v[::qstep, ::qstep].T * _decay)
-		orig_sc.set_offsets(orig)
-		def_sc.set_offsets(deff)
+		angle_deg = float(np.degrees(heading_rad))
+		_update_mesh_lines_common(orig_mesh_lines, sim.geometry.mesh_edges, orig)
+		_update_whisker_ellipses_common(orig_whiskers, orig, angle_deg)
+		_update_whisker_ellipses_common(def_whiskers, deff, angle_deg)
+		delta = deff - orig
+		deflection_quiver.set_offsets(orig)
+		deflection_quiver.set_UVC(delta[:, 0], delta[:, 1])
 		center_dot.set_data([float(center[0])], [float(center[1])])
 		center_traj_line.set_data(center_hist[: frame_idx + 1, 0], center_hist[: frame_idx + 1, 1])
 		for whisker_idx, ln in enumerate(whisker_traj_lines):
@@ -1116,8 +1165,10 @@ def _save_headless_animation(
 			bg,
 			flow_q,
 			finish_line,
-			orig_sc,
-			def_sc,
+			*orig_mesh_lines,
+			*orig_whiskers,
+			*def_whiskers,
+			deflection_quiver,
 			center_dot,
 			center_traj_line,
 			*whisker_traj_lines,
@@ -1179,21 +1230,21 @@ def _run_headless_mode(
 	sim.state.velocity = np.array([constant_speed_mps, 0.0], dtype=float)
 	sim.state.heading = 0.0
 
-	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
+	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float]] = []
 	next_save_t = 0.0
 	save_dt = 1.0 / save_fps
 
 	initial_orig = sim.world_whisker_centers()
 	initial_def, _ = sim._sample_deflected_centers(initial_orig)
 	if save_file is not None:
-		sampled_frames.append((sim.time, initial_orig.copy(), initial_def.copy(), sim.state.position.copy()))
+		sampled_frames.append((sim.time, initial_orig.copy(), initial_def.copy(), sim.state.position.copy(), float(sim.state.heading)))
 		next_save_t = save_dt
 
 	fixed_vel = np.array([constant_speed_mps, 0.0], dtype=float)
 	while True:
 		orig, deff, _ = sim.step_with_velocity(fixed_vel)
 		if save_file is not None and sim.time + 1e-12 >= next_save_t:
-			sampled_frames.append((sim.time, orig.copy(), deff.copy(), sim.state.position.copy()))
+			sampled_frames.append((sim.time, orig.copy(), deff.copy(), sim.state.position.copy(), float(sim.state.heading)))
 			next_save_t += save_dt
 
 		if float(sim.state.position[0]) >= sim.config.finish_x:
@@ -1202,7 +1253,7 @@ def _run_headless_mode(
 	# Ensure final frame is included in export.
 	if save_file is not None:
 		if not sampled_frames or sampled_frames[-1][0] < sim.time - 1e-12:
-			sampled_frames.append((sim.time, orig.copy(), deff.copy(), sim.state.position.copy()))
+			sampled_frames.append((sim.time, orig.copy(), deff.copy(), sim.state.position.copy(), float(sim.state.heading)))
 		_save_headless_animation(
 			sim,
 			sampled_frames,
@@ -1219,6 +1270,135 @@ def _run_headless_mode(
 	if sim.profiler is not None:
 		sim.profiler.print_report(header="[profile] finish-line summary")
 	return
+
+
+def _load_replay_data(replay_path: str | Path) -> np.ndarray:
+	"""Load replay table with 5 columns: t, x, y, x_vel, y_vel (SI units)."""
+	fp = Path(replay_path)
+	if not fp.is_file():
+		raise ValueError(f"replay file not found: {fp}")
+
+	try:
+		data = np.loadtxt(fp, delimiter=",")
+	except Exception:
+		try:
+			data = np.loadtxt(fp, delimiter=",", skiprows=1)
+		except Exception:
+			try:
+				data = np.loadtxt(fp)
+			except Exception:
+				data = np.loadtxt(fp, skiprows=1)
+
+	arr = np.asarray(data, dtype=float)
+	if arr.ndim == 1:
+		if arr.size < 5:
+			raise ValueError("replay file must contain at least 5 columns: t,x,y,x_vel,y_vel")
+		arr = arr[None, :]
+	if arr.ndim != 2 or arr.shape[1] < 5:
+		raise ValueError("replay file must be a 2D table with at least 5 columns: t,x,y,x_vel,y_vel")
+
+	arr = arr[:, :5]
+	if arr.shape[0] < 1:
+		raise ValueError("replay file contains no rows")
+	if not np.all(np.isfinite(arr)):
+		raise ValueError("replay file contains NaN/Inf values")
+	if np.any(np.diff(arr[:, 0]) < 0.0):
+		raise ValueError("replay time column must be nondecreasing")
+	return arr
+
+
+def _save_replay_data(replay_txyvv: np.ndarray, output_path: str | Path) -> None:
+	"""Save replay table as CSV with columns: t, x, y, x_vel, y_vel."""
+	arr = np.asarray(replay_txyvv, dtype=float)
+	if arr.ndim != 2 or arr.shape[1] < 5:
+		raise ValueError("replay array must be shape (N,5+) with t,x,y,x_vel,y_vel")
+	if arr.shape[0] < 1:
+		print("[replay] no replay rows recorded; skipping save")
+		return
+
+	out = Path(output_path)
+	out.parent.mkdir(parents=True, exist_ok=True)
+	np.savetxt(
+		out,
+		arr[:, :5],
+		delimiter=",",
+		header="t,x,y,x_vel,y_vel",
+		comments="",
+		fmt="%.9f",
+	)
+	print(f"[replay] saved: {out} ({arr.shape[0]} rows)")
+
+
+def _apply_replay_row_to_sim(sim: WhiskerArraySimulator, row_txyvv: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+	"""Apply one replay row to simulator state and sample whisker deflection."""
+	t = float(row_txyvv[0])
+	x = float(row_txyvv[1])
+	y = float(row_txyvv[2])
+	vx = float(row_txyvv[3])
+	vy = float(row_txyvv[4])
+
+	sim.time = t
+	sim.state.position = np.array([x, y], dtype=float)
+	sim.state.velocity = np.array([vx, vy], dtype=float)
+	v_mag = float(np.hypot(vx, vy))
+	if v_mag > 1e-9:
+		sim.state.heading = float(np.arctan2(vy, vx))
+	sim.current_flow_frame = None
+	sim.current_flow_signature = None
+	sim._update_current_flow_frame()
+	orig = sim.world_whisker_centers()
+	deff, _ = sim._sample_deflected_centers(orig)
+	return orig, deff
+
+
+def _run_headless_replay_mode(
+	sim: WhiskerArraySimulator,
+	*,
+	replay_txyvv: np.ndarray,
+	save_file: str | Path | None = None,
+	save_fps: float = 10.0,
+	save_dpi: int = 90,
+	object_traj_xy: np.ndarray | None = None,
+) -> None:
+	"""Headless non-interactive runner driven by replay rows until replay end-time."""
+	if replay_txyvv.shape[0] < 1:
+		raise ValueError("replay_txyvv must contain at least one row")
+	if save_fps <= 0.0:
+		raise ValueError("save_fps must be positive")
+
+	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float]] = []
+	next_save_t = float(replay_txyvv[0, 0])
+	save_dt = 1.0 / save_fps
+	last_orig: np.ndarray | None = None
+	last_deff: np.ndarray | None = None
+	last_heading: float | None = None
+
+	for row in replay_txyvv:
+		orig, deff = _apply_replay_row_to_sim(sim, row)
+		last_orig = orig
+		last_deff = deff
+		last_heading = float(sim.state.heading)
+		t = float(sim.time)
+		if save_file is not None and t + 1e-12 >= next_save_t:
+			sampled_frames.append((t, orig.copy(), deff.copy(), sim.state.position.copy(), float(sim.state.heading)))
+			next_save_t += save_dt
+
+	if save_file is not None and last_orig is not None and last_deff is not None and last_heading is not None:
+		if not sampled_frames or sampled_frames[-1][0] < sim.time - 1e-12:
+			sampled_frames.append((sim.time, last_orig.copy(), last_deff.copy(), sim.state.position.copy(), last_heading))
+		_save_headless_animation(
+			sim,
+			sampled_frames,
+			output_path=save_file,
+			fps=save_fps,
+			object_traj_xy=object_traj_xy,
+			save_dpi=save_dpi,
+		)
+
+	print(
+		f"[replay] finished at t={sim.time:.3f}s, x={sim.state.position[0]:.3f}m, y={sim.state.position[1]:.3f}m, "
+		f"rows={replay_txyvv.shape[0]}"
+	)
 
 
 def _load_matching_trajectory(
@@ -1394,6 +1574,34 @@ def _build_flow_cases(
 	return cases, initial_idx
 
 
+def _create_mesh_lines(
+	ax: Axes,
+	mesh_edges: list[tuple[int, int]],
+	*,
+	color: str,
+	lw: float,
+	alpha: float,
+	zorder: int = 2,
+) -> list[Line2D]:
+	lines: list[Line2D] = []
+	for _ in mesh_edges:
+		ln = Line2D([], [], color=color, lw=lw, alpha=alpha, zorder=zorder)
+		ax.add_line(ln)
+		lines.append(ln)
+	return lines
+
+
+def _update_mesh_lines_common(lines: list[Line2D], mesh_edges: list[tuple[int, int]], pts: np.ndarray) -> None:
+	for ln, (i, j) in zip(lines, mesh_edges):
+		ln.set_data([pts[i, 0], pts[j, 0]], [pts[i, 1], pts[j, 1]])
+
+
+def _update_whisker_ellipses_common(ellipses: list[Ellipse], centers: np.ndarray, angle_deg: float) -> None:
+	for e, p in zip(ellipses, centers):
+		e.center = (float(p[0]), float(p[1]))
+		e.angle = angle_deg
+
+
 @dataclass
 class SimulationRenderer:
 	"""Matplotlib renderer for whisker array state and flow backdrop."""
@@ -1407,20 +1615,22 @@ class SimulationRenderer:
 	use_dynamic_flow: bool = False
 	flow_decay_half_life: float = 0.0
 	array_trajectory_txy: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=float), init=False)
+	array_replay_txyvv: np.ndarray = field(default_factory=lambda: np.empty((0, 5), dtype=float), init=False)
 	last_flow_signature: tuple[int, float] | None = field(default=None, init=False)
 	_last_decay_visual_t: float = field(default=-1e18, init=False)
 
 	def _build_mesh_lines(self, color: str, lw: float, alpha: float, zorder: int = 2) -> list[Line2D]:
-		lines: list[Line2D] = []
-		for _ in self.sim.geometry.mesh_edges:
-			ln = Line2D([], [], color=color, lw=lw, alpha=alpha, zorder=zorder)
-			self.ax.add_line(ln)
-			lines.append(ln)
-		return lines
+		return _create_mesh_lines(
+			self.ax,
+			self.sim.geometry.mesh_edges,
+			color=color,
+			lw=lw,
+			alpha=alpha,
+			zorder=zorder,
+		)
 
 	def _update_mesh_lines(self, lines: list[Line2D], pts: np.ndarray) -> None:
-		for ln, (i, j) in zip(lines, self.sim.geometry.mesh_edges):
-			ln.set_data([pts[i, 0], pts[j, 0]], [pts[i, 1], pts[j, 1]])
+		_update_mesh_lines_common(lines, self.sim.geometry.mesh_edges, pts)
 
 	def setup(self) -> None:
 		ext = self.sim.flow.extent()
@@ -1490,7 +1700,7 @@ class SimulationRenderer:
 				self.traj_line.set_data(xy[:, 0], xy[:, 1])
 
 		# Layer order: original (zorder=2) → arrows (3) → deflected (4)
-		self.orig_mesh_lines = self._build_mesh_lines(color="tab:grey", lw=1.8, alpha=0.85, zorder=2)
+		self.orig_mesh_lines = self._build_mesh_lines(color="tab:grey", lw=1.5, alpha=0.85, zorder=2)
 
 		n = self.sim.geometry.layout_xy.shape[0]
 		self.whisker_traj_lines: list[Line2D] = []
@@ -1504,7 +1714,7 @@ class SimulationRenderer:
 			e_orig = Ellipse((0.0, 0.0), width=self.sim.geometry.ellipse_major, height=self.sim.geometry.ellipse_minor)
 			e_orig.set_edgecolor("tab:grey")
 			e_orig.set_facecolor("none")
-			e_orig.set_linewidth(2.0)
+			e_orig.set_linewidth(1.5)
 			e_orig.set_zorder(2)
 			self.ax.add_patch(e_orig)
 			self.whisker_orig.append(e_orig)
@@ -1518,13 +1728,16 @@ class SimulationRenderer:
 			zorder=3, animated=True,
 		)
 
-		self.def_mesh_lines = self._build_mesh_lines(color="tab:orange", lw=1.8, alpha=0.5, zorder=4)
+		self.def_mesh_lines = self._build_mesh_lines(color="tab:orange", lw=1.2, alpha=0.5, zorder=4)
+		for ln in self.def_mesh_lines:
+			ln.set_visible(False)
 		for _ in range(n):
 			e_def = Ellipse((0.0, 0.0), width=self.sim.geometry.ellipse_major, height=self.sim.geometry.ellipse_minor)
 			e_def.set_edgecolor("tab:orange")
 			e_def.set_facecolor("none")
-			e_def.set_linewidth(2.0)
+			e_def.set_linewidth(1.0)
 			e_def.set_zorder(4)
+			e_def.set_visible(False)
 			self.ax.add_patch(e_def)
 			self.whisker_def.append(e_def)
 		xmin, xmax, ymin, ymax = ext
@@ -1584,12 +1797,8 @@ class SimulationRenderer:
 
 	def _update_whisker_shapes(self, orig: np.ndarray, deff: np.ndarray) -> None:
 		angle_deg = np.degrees(self.sim.state.heading)
-		for e, p in zip(self.whisker_orig, orig):
-			e.center = (float(p[0]), float(p[1]))
-			e.angle = angle_deg
-		for e, p in zip(self.whisker_def, deff):
-			e.center = (float(p[0]), float(p[1]))
-			e.angle = angle_deg
+		_update_whisker_ellipses_common(self.whisker_orig, orig, angle_deg)
+		_update_whisker_ellipses_common(self.whisker_def, deff, angle_deg)
 
 	def _animated_artists(self) -> tuple:
 		artists: list = [
@@ -1605,15 +1814,19 @@ class SimulationRenderer:
 			artists.append(self.flow_q)
 		return tuple(artists)
 
-	def animate(self, input_provider: InputProvider) -> None:
+	def animate(self, input_provider: InputProvider | None, replay_txyvv: np.ndarray | None = None, save_replay: str | Path | None = None) -> None:
 		self.setup()
 		paused = {"value": True}
 		finished = {"value": False, "x_mm": None, "t": None}
 		flow_visible = {"value": False}
 		traj_visible = {"value": False}
 		base_visible = {"value": True}
-		deflected_visible = {"value": True}
+		deflected_visible = {"value": False}
 		arrows_visible = {"value": True}
+		replay_mode = replay_txyvv is not None
+		replay_idx = {"value": 0}
+		save_replay_path = Path(save_replay) if save_replay is not None else None
+		save_replay_run = {"value": 0}  # counts completed runs for numbered filenames
 		keyboard = input_provider if isinstance(input_provider, KeyboardInput) else None
 		self.text.set_text("Press space to start")
 		self.bg.set_visible(False)
@@ -1625,6 +1838,8 @@ class SimulationRenderer:
 			self.text.set_text("Press space to start | F1: Help")
 
 		def _set_small_initial_velocity() -> None:
+			if replay_mode:
+				return
 			init_vx = float(min(0.1, self.sim.config.max_speed * 0.3))
 			self.sim.state.velocity = np.array([init_vx, 0.0], dtype=float)
 			if keyboard is not None:
@@ -1642,19 +1857,27 @@ class SimulationRenderer:
 
 		center_time_hist: list[float] = []
 		center_xy_hist: list[np.ndarray] = []
+		center_vel_hist: list[np.ndarray] = []
 		whisker_xy_hist: list[np.ndarray] = []
 
 		def _reset_recorded_trajectory() -> None:
 			center_time_hist.clear()
 			center_xy_hist.clear()
+			center_vel_hist.clear()
 			whisker_xy_hist.clear()
 
 			pos = self.sim.state.position.copy()
+			vel = self.sim.state.velocity.copy()
 			orig = self.sim.world_whisker_centers().copy()
 			center_time_hist.append(float(self.sim.time))
 			center_xy_hist.append(np.array([float(pos[0]), float(pos[1])], dtype=float))
+			center_vel_hist.append(np.array([float(vel[0]), float(vel[1])], dtype=float))
 			whisker_xy_hist.append(orig)
 			self.array_trajectory_txy = np.array([[float(self.sim.time), float(pos[0]), float(pos[1])]], dtype=float)
+			self.array_replay_txyvv = np.array(
+				[[float(self.sim.time), float(pos[0]), float(pos[1]), float(vel[0]), float(vel[1])]],
+				dtype=float,
+			)
 
 			changed = self.array_center_traj_line.get_visible() or any(ln.get_visible() for ln in self.whisker_traj_lines)
 			self.array_center_traj_line.set_data([], [])
@@ -1667,8 +1890,10 @@ class SimulationRenderer:
 
 		def _append_recorded_trajectory(orig: np.ndarray) -> None:
 			pos = self.sim.state.position
+			vel = self.sim.state.velocity
 			center_time_hist.append(float(self.sim.time))
 			center_xy_hist.append(np.array([float(pos[0]), float(pos[1])], dtype=float))
+			center_vel_hist.append(np.array([float(vel[0]), float(vel[1])], dtype=float))
 			whisker_xy_hist.append(orig.copy())
 
 		def _reveal_recorded_trajectory() -> None:
@@ -1677,6 +1902,15 @@ class SimulationRenderer:
 			centers = np.vstack(center_xy_hist)
 			times = np.asarray(center_time_hist, dtype=float)
 			self.array_trajectory_txy = np.column_stack((times, centers))
+			vels = np.vstack(center_vel_hist)
+			self.array_replay_txyvv = np.column_stack((times, centers, vels))
+
+			if save_replay_path is not None:
+				save_replay_run["value"] += 1
+				stem = save_replay_path.stem
+				suffix = save_replay_path.suffix or ".csv"
+				out_path = save_replay_path.with_name(f"{stem}_{save_replay_run['value']:03d}{suffix}")
+				_save_replay_data(self.array_replay_txyvv, out_path)
 
 			self.array_center_traj_line.set_data(centers[:, 0], centers[:, 1])
 			self.array_center_traj_line.set_visible(True)
@@ -1688,6 +1922,8 @@ class SimulationRenderer:
 					ln.set_visible(True)
 			_redraw_static_after_toggle()
 
+		if replay_mode and replay_txyvv is not None and replay_txyvv.shape[0] > 0:
+			_apply_replay_row_to_sim(self.sim, replay_txyvv[0])
 		_set_small_initial_velocity()
 		_refresh_preview_pose()
 		_reset_recorded_trajectory()
@@ -1898,6 +2134,9 @@ class SimulationRenderer:
 				_toggle_traj()
 			if event.key in ("r", "R"):
 				self.sim.reset()
+				replay_idx["value"] = 0
+				if replay_mode and replay_txyvv is not None and replay_txyvv.shape[0] > 0:
+					_apply_replay_row_to_sim(self.sim, replay_txyvv[0])
 				if keyboard is not None:
 					keyboard.reset()
 				_set_small_initial_velocity()
@@ -1938,11 +2177,28 @@ class SimulationRenderer:
 				return self._animated_artists()
 
 			if not finished["value"]:
-				control_started = perf_counter()
-				cmd = input_provider.read()
-				if self.sim.profiler is not None:
-					self.sim.profiler.record("control_read", perf_counter() - control_started)
-				orig, deff, _ = self.sim.step(cmd)
+				if replay_mode and replay_txyvv is not None:
+					if replay_idx["value"] >= replay_txyvv.shape[0]:
+						finished["value"] = True
+						finished["x_mm"] = float(self.sim.state.position[0] * 1000.0)
+						finished["t"] = float(self.sim.time)
+						self.sim.state.velocity[:] = 0.0
+						_reveal_recorded_trajectory()
+						_show_flow_and_traj()
+						orig = self.sim.world_whisker_centers()
+						deff = orig.copy()
+					else:
+						row = replay_txyvv[replay_idx["value"]]
+						replay_idx["value"] += 1
+						orig, deff = _apply_replay_row_to_sim(self.sim, row)
+				else:
+					if input_provider is None:
+						raise RuntimeError("input_provider is required for non-replay interactive mode")
+					control_started = perf_counter()
+					cmd = input_provider.read()
+					if self.sim.profiler is not None:
+						self.sim.profiler.record("control_read", perf_counter() - control_started)
+					orig, deff, _ = self.sim.step(cmd)
 				traj_started = perf_counter()
 				_append_recorded_trajectory(orig)
 				if self.sim.profiler is not None:
@@ -1976,7 +2232,7 @@ class SimulationRenderer:
 				self.sim.profiler.record("render_arrow_update", perf_counter() - arrow_started)
 
 			x_center = float(self.sim.state.position[0])
-			if (not finished["value"]) and x_center >= self.sim.config.finish_x:
+			if (not replay_mode) and (not finished["value"]) and x_center >= self.sim.config.finish_x:
 				finished["value"] = True
 				finished["x_mm"] = x_center * 1000.0
 				finished["t"] = self.sim.time
@@ -1989,10 +2245,16 @@ class SimulationRenderer:
 				vel = self.sim.state.velocity
 				v_mag = float(np.linalg.norm(vel))
 				v_deg = float(np.degrees(np.arctan2(vel[1], vel[0]))) if v_mag > 1e-9 else 0.0
-				self.text.set_text(
-					f"Finished at x={float(finished['x_mm']):.1f} mm, t={float(finished['t']):.2f} s | "
-					f"pos=({pos[0]:.3f}, {pos[1]:.3f}) m | vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | Press R to restart | F1: Help"
-				)
+				if replay_mode:
+					self.text.set_text(
+						f"Replay finished at t={float(finished['t']):.2f} s | "
+						f"pos=({pos[0]:.3f}, {pos[1]:.3f}) m | vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | Press R to replay | F1: Help"
+					)
+				else:
+					self.text.set_text(
+						f"Finished at x={float(finished['x_mm']):.1f} mm, t={float(finished['t']):.2f} s | "
+						f"pos=({pos[0]:.3f}, {pos[1]:.3f}) m | vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | Press R to restart | F1: Help"
+					)
 				if self.sim.profiler is not None:
 					self.sim.profiler.record("text_update", perf_counter() - text_started)
 					self.sim.profiler.record("tick_total", perf_counter() - tick_started)
@@ -2026,7 +2288,14 @@ class SimulationRenderer:
 		try:
 			plt.show()
 		finally:
-			input_provider.shutdown()
+			if center_xy_hist and center_vel_hist:
+				times = np.asarray(center_time_hist, dtype=float)
+				centers = np.vstack(center_xy_hist)
+				vels = np.vstack(center_vel_hist)
+				self.array_trajectory_txy = np.column_stack((times, centers))
+				self.array_replay_txyvv = np.column_stack((times, centers, vels))
+			if input_provider is not None:
+				input_provider.shutdown()
 
 
 def _build_input_provider(
@@ -2048,6 +2317,8 @@ def run_simulation(
 	data_path: str | Path | None = None,
 	*,
 	array_config: str | Path | None = None,
+	replay: str | Path | None = None,
+	save_replay: str | Path | None = None,
 	data_root: str | Path | None = None,
 	traj_path: str | Path | None = None,
 	exclude_list: str | Path | None = None,
@@ -2083,6 +2354,13 @@ def run_simulation(
 		raise ValueError("flow_time_delay must be >= 0")
 	if finish_x_mm <= 0.0:
 		raise ValueError("finish_x_mm must be positive")
+	if save_dpi <= 0:
+		raise ValueError("save_dpi must be positive")
+
+	replay_txyvv: np.ndarray | None = None
+	if replay is not None:
+		replay_txyvv = _load_replay_data(replay)
+		print(f"[replay] loaded {replay_txyvv.shape[0]} rows from {Path(replay)}")
 
 	flow_cases, initial_case_idx = _build_flow_cases(
 		data_path=data_path,
@@ -2109,9 +2387,17 @@ def run_simulation(
 	else:
 		geometry = WhiskerArrayGeometry.regular_grid(rows=rows, cols=cols, spacing=spacing)
 	ext = flow.extent()
-	init_pos = np.array([0.05, float(np.random.uniform(ext[2], ext[3]))], dtype=float)
-	init_vx = float(min(0.03, max_speed * 0.1))
-	state = ArrayState(position=init_pos, velocity=np.array([init_vx, 0.0], dtype=float), heading=0.0)
+	if replay_txyvv is not None and replay_txyvv.shape[0] > 0:
+		first = replay_txyvv[0]
+		init_pos = np.array([float(first[1]), float(first[2])], dtype=float)
+		init_vel = np.array([float(first[3]), float(first[4])], dtype=float)
+		init_speed = float(np.linalg.norm(init_vel))
+		init_heading = float(np.arctan2(init_vel[1], init_vel[0])) if init_speed > 1e-9 else 0.0
+		state = ArrayState(position=init_pos, velocity=init_vel, heading=init_heading)
+	else:
+		init_pos = np.array([0.05, float(np.random.uniform(ext[2], ext[3]))], dtype=float)
+		init_vx = float(min(0.03, max_speed * 0.1))
+		state = ArrayState(position=init_pos, velocity=np.array([init_vx, 0.0], dtype=float), heading=0.0)
 	dt = 1.0 / fps
 	config = SimulatorConfig(
 		max_speed=max_speed,
@@ -2130,6 +2416,8 @@ def run_simulation(
 		state=state,
 		profiler=StepProfiler() if profile_step else None,
 	)
+	if replay_txyvv is not None and replay_txyvv.shape[0] > 0:
+		sim.time = float(replay_txyvv[0, 0])
 	if save_file is not None and not headless:
 		print("[headless] --save-file provided; enabling headless mode")
 		headless = True
@@ -2138,24 +2426,27 @@ def run_simulation(
 		import matplotlib
 		matplotlib.use("Agg")
 		start = perf_counter()
-		_run_headless_mode(
-			sim,
-			sample_rate_hz=fps,
-			save_file=save_file,
-			save_fps=save_fps,
-			save_dpi=save_dpi,
-			object_traj_xy=initial_case.traj_xy,
-		)
+		if replay_txyvv is not None:
+			_run_headless_replay_mode(
+				sim,
+				replay_txyvv=replay_txyvv,
+				save_file=save_file,
+				save_fps=save_fps,
+				save_dpi=save_dpi,
+				object_traj_xy=initial_case.traj_xy,
+			)
+		else:
+			_run_headless_mode(
+				sim,
+				sample_rate_hz=fps,
+				save_file=save_file,
+				save_fps=save_fps,
+				save_dpi=save_dpi,
+				object_traj_xy=initial_case.traj_xy,
+			)
 		print(f'Headless mode done in {perf_counter() - start:.3f} s')
 		return
 
-	accel_per_frame = max_accel * dt * 0.25
-	provider, provider_name = _build_input_provider(
-		prefer_gamepad=prefer_gamepad,
-		max_speed=max_speed,
-		accel_per_frame=accel_per_frame,
-	)
-	print(f"[input] using {provider_name}")
 	renderer = SimulationRenderer(
 		sim=sim,
 		flow_cases=flow_cases,
@@ -2163,7 +2454,18 @@ def run_simulation(
 		use_dynamic_flow=dynamic_flow,
 		flow_decay_half_life=flow_decay,
 	)
-	renderer.animate(provider)
+	if replay_txyvv is not None:
+		print("[replay] interactive replay mode enabled")
+		renderer.animate(None, replay_txyvv=replay_txyvv, save_replay=save_replay)
+	else:
+		accel_per_frame = max_accel * dt * 0.25
+		provider, provider_name = _build_input_provider(
+			prefer_gamepad=prefer_gamepad,
+			max_speed=max_speed,
+			accel_per_frame=accel_per_frame,
+		)
+		print(f"[input] using {provider_name}")
+		renderer.animate(provider, save_replay=save_replay)
 
 
 if __name__ == "__main__":
@@ -2190,6 +2492,18 @@ if __name__ == "__main__":
 	)
 	parser.add_argument("--fps", type=float, default=10.0, help="Simulation step rate in Hz for both interactive and headless modes (default: 10)")
 	parser.add_argument("--flow-dt", type=float, default=0.04, help="Time spacing of flow frames (s)")
+	parser.add_argument(
+		"--replay",
+		type=Path,
+		default=None,
+		help="Replay file with 5 columns: t,x,y,x_vel,y_vel (SI units)",
+	)
+	parser.add_argument(
+		"--save-replay",
+		type=Path,
+		default=None,
+		help="Save played interactive trajectory to CSV with columns t,x,y,x_vel,y_vel",
+	)
 	parser.add_argument(
 		"--dynamic-flow",
 		action="store_true",
@@ -2270,6 +2584,8 @@ if __name__ == "__main__":
 	run_simulation(
 		args.data_path,
 		array_config=args.array_config,
+		replay=args.replay,
+		save_replay=args.save_replay,
 		data_root=args.data_root,
 		traj_path=args.traj_path,
 		exclude_list=args.exclude_list,
