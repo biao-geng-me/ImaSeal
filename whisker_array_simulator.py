@@ -1011,6 +1011,7 @@ def _save_headless_animation(
 	output_path: str | Path,
 	fps: float,
 	object_traj_xy: np.ndarray | None = None,
+	save_dpi: int = 90,
 ) -> None:
 	"""Save a compact animation of the headless run.
 
@@ -1134,7 +1135,7 @@ def _save_headless_animation(
 	)
 
 	if ext == ".gif":
-		anim.save(str(output), writer="pillow", fps=int(round(fps)), dpi=80)
+		anim.save(str(output), writer="pillow", fps=int(round(fps)), dpi=save_dpi)
 	else:
 		try:
 			writer = FFMpegWriter(
@@ -1143,10 +1144,10 @@ def _save_headless_animation(
 				bitrate=600,
 				extra_args=["-preset", "veryfast", "-crf", "32", "-pix_fmt", "yuv420p"],
 			)
-			anim.save(str(output), writer=writer, dpi=90)
+			anim.save(str(output), writer=writer, dpi=save_dpi)
 		except Exception:
 			fallback = output.with_suffix(".gif")
-			anim.save(str(fallback), writer="pillow", fps=int(round(fps)), dpi=80)
+			anim.save(str(fallback), writer="pillow", fps=int(round(fps)), dpi=save_dpi)
 			print(f"[headless] ffmpeg unavailable; wrote GIF instead: {fallback}")
 
 	plt.close(fig)
@@ -1159,6 +1160,7 @@ def _run_headless_mode(
 	sample_rate_hz: float = 80.0,
 	save_file: str | Path | None = None,
 	save_fps: float = 10.0,
+	save_dpi: int = 90,
 	start_xy_m: tuple[float, float] = (0.150, 0.500),
 	constant_speed_mps: float = 0.2,
 	object_traj_xy: np.ndarray | None = None,
@@ -1207,6 +1209,7 @@ def _run_headless_mode(
 			output_path=save_file,
 			fps=save_fps,
 			object_traj_xy=object_traj_xy,
+			save_dpi=save_dpi,
 		)
 
 	print(
@@ -2066,6 +2069,7 @@ def run_simulation(
 	headless: bool = False,
 	save_file: str | Path | None = None,
 	save_fps: float = 10.0,
+	save_dpi: int = 90,
 ) -> None:
 	"""Entry point for whisker-array simulation."""
 
@@ -2131,12 +2135,15 @@ def run_simulation(
 		headless = True
 
 	if headless:
+		import matplotlib
+		matplotlib.use("Agg")
 		start = perf_counter()
 		_run_headless_mode(
 			sim,
 			sample_rate_hz=fps,
 			save_file=save_file,
 			save_fps=save_fps,
+			save_dpi=save_dpi,
 			object_traj_xy=initial_case.traj_xy,
 		)
 		print(f'Headless mode done in {perf_counter() - start:.3f} s')
@@ -2252,6 +2259,12 @@ if __name__ == "__main__":
 		default=10.0,
 		help="Output frame rate when saving headless animation (default: 10 FPS)",
 	)
+	parser.add_argument(
+		"--save-dpi",
+		type=int,
+		default=90,
+		help="DPI for saved animation (default: 90; 6.4x4.2 in figure gives 576x378 px at 90 dpi)",
+	)
 	args = parser.parse_args()
 
 	run_simulation(
@@ -2278,4 +2291,5 @@ if __name__ == "__main__":
 		headless=args.headless,
 		save_file=args.save_file,
 		save_fps=args.save_fps,
+		save_dpi=args.save_dpi,
 	)
