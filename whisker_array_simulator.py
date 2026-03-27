@@ -1033,7 +1033,9 @@ def _save_headless_animation(
 		output = output.with_suffix(".mp4")
 		ext = ".mp4"
 
-	fig, ax = plt.subplots(figsize=(6.4, 4.2))
+	fig, ax = plt.subplots(figsize=(8.0, 4.5))
+	# Keep labels/titles readable while trimming default canvas whitespace.
+	fig.subplots_adjust(left=0.10, right=0.96, bottom=0.10, top=0.92)
 	extent = sim.flow.extent()
 	ax.set_xlim(extent[0], extent[1])
 	ax.set_ylim(extent[2], extent[3])
@@ -1132,7 +1134,7 @@ def _save_headless_animation(
 
 	center_hist = np.vstack([frame[3] for frame in sampled_frames])
 	whisker_hist = np.stack([frame[1] for frame in sampled_frames], axis=0)
-	(center_traj_line,) = ax.plot([], [], color="tab:green", lw=1.6, alpha=0.8, zorder=2.6, label="array center")
+	(center_traj_line,) = ax.plot([], [], color="tab:green", lw=1.6, alpha=0.8, zorder=2.6)
 	whisker_traj_lines: list[Line2D] = []
 	for whisker_idx in range(whisker_hist.shape[1]):
 		(ln,) = ax.plot([], [], color="tab:purple", lw=0.9, alpha=0.25, zorder=2.55)
