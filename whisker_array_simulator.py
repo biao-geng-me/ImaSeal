@@ -48,11 +48,17 @@ from typing import Protocol
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FFMpegWriter, FuncAnimation
+from matplotlib.axes import Axes
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
 
 from read_plt import read_plt75
+from signal_history_view import SignalHistoryView
 from visualize_flow import FlowFrame2D, _compute_vorticity, _extract_2d, load_flow_frames
+
+
+SIGNAL_PANEL_WIDTH_RATIO = 1.0
+MAIN_PANEL_WIDTH_RATIO = 5.5
 
 
 _pygame_spec = importlib.util.find_spec("pygame")
@@ -116,6 +122,7 @@ class StepProfiler:
 				"simulation_step_total",
 				"trajectory_record",
 				"render_flow_update",
+					"render_signal_update",
 				"render_mesh_update",
 				"render_shape_update",
 				"render_arrow_update",
@@ -1010,7 +1017,7 @@ class WhiskerArraySimulator:
 
 def _save_headless_animation(
 	sim: WhiskerArraySimulator,
-	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float]],
+	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]],
 	output_path: str | Path,
 	fps: float,
 	object_traj_xy: np.ndarray | None = None,
@@ -1018,7 +1025,7 @@ def _save_headless_animation(
 ) -> Path:
 	"""Save a compact animation of the headless run.
 
-	Each sampled frame tuple is ``(t, orig_centers, deflected_centers, array_center, heading_rad)``.
+	Each sampled frame tuple is ``(t, orig_centers, deflected_centers, array_center, heading_rad, whisker_signal_xy)``.
 	Returns the final file path that was written.
 	"""
 	if fps <= 0.0:
@@ -1034,9 +1041,18 @@ def _save_headless_animation(
 		output = output.with_suffix(".mp4")
 		ext = ".mp4"
 
-	fig, ax = plt.subplots(figsize=(8.0, 4.5))
-	# Keep labels/titles readable while trimming default canvas whitespace.
-	fig.subplots_adjust(left=0.10, right=0.96, bottom=0.10, top=0.92)
+	fig = plt.figure(figsize=(11.0, 5.6))
+	gs = fig.add_gridspec(
+		1,
+		2,
+		width_ratios=[SIGNAL_PANEL_WIDTH_RATIO, MAIN_PANEL_WIDTH_RATIO],
+		wspace=0.04,
+	)
+	# Keep main view large while preserving compact per-whisker signal rows.
+	fig.subplots_adjust(left=0.03, right=0.99, bottom=0.09, top=0.95)
+	signal_view = SignalHistoryView(num_whiskers=sim.geometry.layout_xy.shape[0])
+	signal_view.create_axes(fig, gs[0, 0])
+	ax = fig.add_subplot(gs[0, 1])
 	extent = sim.flow.extent()
 	ax.set_xlim(extent[0], extent[1])
 	ax.set_ylim(extent[2], extent[3])
@@ -1144,9 +1160,12 @@ def _save_headless_animation(
 	if object_traj_xy is not None and object_traj_xy.size > 0:
 		ax.legend(loc="upper right", fontsize=8)
 	title = ax.set_title("", fontsize=10)
+	frame_times = np.asarray([frame[0] for frame in sampled_frames], dtype=float)
+	frame_signals = np.stack([frame[5] for frame in sampled_frames], axis=0)
+	signal_view.set_history(frame_times[:1], frame_signals[:1])
 
 	def _update(frame_idx: int):
-		t, orig, deff, center, heading_rad = sampled_frames[frame_idx]
+		t, orig, deff, center, heading_rad, _signal_xy = sampled_frames[frame_idx]
 		flow_idx = sim.flow._frame_index(t=t, flow_dt=sim.config.flow_dt)
 		f = sim.flow.frames[flow_idx]
 		_decay = sim.flow._decay_factor(t, sim.config.flow_dt)
@@ -1166,6 +1185,7 @@ def _save_headless_animation(
 				whisker_hist[: frame_idx + 1, whisker_idx, 0],
 				whisker_hist[: frame_idx + 1, whisker_idx, 1],
 			)
+		signal_view.set_history(frame_times[: frame_idx + 1], frame_signals[: frame_idx + 1])
 		title.set_text(f"t={t:.1f}s")
 		return (
 			bg,
@@ -1178,6 +1198,7 @@ def _save_headless_animation(
 			center_dot,
 			center_traj_line,
 			*whisker_traj_lines,
+			*signal_view.animated_artists(),
 			title,
 		)
 
@@ -1238,21 +1259,39 @@ def _run_headless_mode(
 	sim.state.velocity = np.array([constant_speed_mps, 0.0], dtype=float)
 	sim.state.heading = 0.0
 
-	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float]] = []
+	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]] = []
 	next_save_t = 0.0
 	save_dt = 1.0 / save_fps
 
 	initial_orig = sim.world_whisker_centers()
-	initial_def, _ = sim._sample_deflected_centers(initial_orig)
+	initial_def, initial_flow_vel = sim._sample_deflected_centers(initial_orig)
 	if save_file is not None:
-		sampled_frames.append((sim.time, initial_orig.copy(), initial_def.copy(), sim.state.position.copy(), float(sim.state.heading)))
+		sampled_frames.append(
+			(
+				sim.time,
+				initial_orig.copy(),
+				initial_def.copy(),
+				sim.state.position.copy(),
+				float(sim.state.heading),
+				initial_flow_vel.copy(),
+			)
+		)
 		next_save_t = save_dt
 
 	fixed_vel = np.array([constant_speed_mps, 0.0], dtype=float)
 	while True:
-		orig, deff, _ = sim.step_with_velocity(fixed_vel)
+		orig, deff, flow_vel = sim.step_with_velocity(fixed_vel)
 		if save_file is not None and sim.time + 1e-12 >= next_save_t:
-			sampled_frames.append((sim.time, orig.copy(), deff.copy(), sim.state.position.copy(), float(sim.state.heading)))
+			sampled_frames.append(
+				(
+					sim.time,
+					orig.copy(),
+					deff.copy(),
+					sim.state.position.copy(),
+					float(sim.state.heading),
+					flow_vel.copy(),
+				)
+			)
 			next_save_t += save_dt
 
 		if float(sim.state.position[0]) >= sim.config.finish_x:
@@ -1261,7 +1300,16 @@ def _run_headless_mode(
 	# Ensure final frame is included in export.
 	if save_file is not None:
 		if not sampled_frames or sampled_frames[-1][0] < sim.time - 1e-12:
-			sampled_frames.append((sim.time, orig.copy(), deff.copy(), sim.state.position.copy(), float(sim.state.heading)))
+			sampled_frames.append(
+				(
+					sim.time,
+					orig.copy(),
+					deff.copy(),
+					sim.state.position.copy(),
+					float(sim.state.heading),
+					flow_vel.copy(),
+				)
+			)
 		_save_headless_animation(
 			sim,
 			sampled_frames,
@@ -1377,7 +1425,7 @@ def _save_replay_data(replay_txyvv: np.ndarray, output_path: str | Path) -> None
 	print(f"[replay] saved: {out} ({arr.shape[0]} rows)")
 
 
-def _apply_replay_row_to_sim(sim: WhiskerArraySimulator, row_txyvv: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _apply_replay_row_to_sim(sim: WhiskerArraySimulator, row_txyvv: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 	"""Apply one replay row to simulator state and sample whisker deflection."""
 	t = float(row_txyvv[0])
 	x = float(row_txyvv[1])
@@ -1395,8 +1443,8 @@ def _apply_replay_row_to_sim(sim: WhiskerArraySimulator, row_txyvv: np.ndarray) 
 	sim.current_flow_signature = None
 	sim._update_current_flow_frame()
 	orig = sim.world_whisker_centers()
-	deff, _ = sim._sample_deflected_centers(orig)
-	return orig, deff
+	deff, flow_vel = sim._sample_deflected_centers(orig)
+	return orig, deff, flow_vel
 
 
 def _run_headless_replay_mode(
@@ -1414,26 +1462,46 @@ def _run_headless_replay_mode(
 	if save_fps <= 0.0:
 		raise ValueError("save_fps must be positive")
 
-	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float]] = []
+	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]] = []
 	next_save_t = float(replay_txyvv[0, 0])
 	save_dt = 1.0 / save_fps
 	last_orig: np.ndarray | None = None
 	last_deff: np.ndarray | None = None
 	last_heading: float | None = None
+	last_flow_vel: np.ndarray | None = None
 
 	for row in replay_txyvv:
-		orig, deff = _apply_replay_row_to_sim(sim, row)
+		orig, deff, flow_vel = _apply_replay_row_to_sim(sim, row)
 		last_orig = orig
 		last_deff = deff
 		last_heading = float(sim.state.heading)
+		last_flow_vel = flow_vel
 		t = float(sim.time)
 		if save_file is not None and t + 1e-12 >= next_save_t:
-			sampled_frames.append((t, orig.copy(), deff.copy(), sim.state.position.copy(), float(sim.state.heading)))
+			sampled_frames.append(
+				(
+					t,
+					orig.copy(),
+					deff.copy(),
+					sim.state.position.copy(),
+					float(sim.state.heading),
+					flow_vel.copy(),
+				)
+			)
 			next_save_t += save_dt
 
-	if save_file is not None and last_orig is not None and last_deff is not None and last_heading is not None:
+	if save_file is not None and last_orig is not None and last_deff is not None and last_heading is not None and last_flow_vel is not None:
 		if not sampled_frames or sampled_frames[-1][0] < sim.time - 1e-12:
-			sampled_frames.append((sim.time, last_orig.copy(), last_deff.copy(), sim.state.position.copy(), last_heading))
+			sampled_frames.append(
+				(
+					sim.time,
+					last_orig.copy(),
+					last_deff.copy(),
+					sim.state.position.copy(),
+					last_heading,
+					last_flow_vel.copy(),
+				)
+			)
 		_save_headless_animation(
 			sim,
 			sampled_frames,
@@ -1666,6 +1734,7 @@ class SimulationRenderer:
 	array_replay_txyvv: np.ndarray = field(default_factory=lambda: np.empty((0, 5), dtype=float), init=False)
 	last_flow_signature: tuple[int, float] | None = field(default=None, init=False)
 	_last_decay_visual_t: float = field(default=-1e18, init=False)
+	signal_view: SignalHistoryView | None = field(default=None, init=False)
 
 	def _build_mesh_lines(self, color: str, lw: float, alpha: float, zorder: int = 2) -> list[Line2D]:
 		return _create_mesh_lines(
@@ -1682,12 +1751,21 @@ class SimulationRenderer:
 
 	def setup(self) -> None:
 		ext = self.sim.flow.extent()
-		self.fig, self.ax = plt.subplots(figsize=(10.5, 7.0))
+		self.fig = plt.figure(figsize=(12.0, 7.0))
+		gs = self.fig.add_gridspec(
+			1,
+			2,
+			width_ratios=[SIGNAL_PANEL_WIDTH_RATIO, MAIN_PANEL_WIDTH_RATIO],
+			wspace=0.04,
+		)
+		self.signal_view = SignalHistoryView(num_whiskers=self.sim.geometry.layout_xy.shape[0])
+		self.signal_view.create_axes(self.fig, gs[0, 0])
+		self.ax = self.fig.add_subplot(gs[0, 1])
 		manager = getattr(self.fig.canvas, "manager", None)
 		handler_id = getattr(manager, "key_press_handler_id", None)
 		if handler_id is not None:
 			self.fig.canvas.mpl_disconnect(handler_id)
-		self.fig.subplots_adjust(left=0.005, right=0.995, bottom=0.005, top=0.995)
+		self.fig.subplots_adjust(left=0.02, right=0.995, bottom=0.04, top=0.995)
 		self.ax.set_xlim(ext[0], ext[1])
 		self.ax.set_ylim(ext[2], ext[3])
 		self.ax.set_aspect("equal")
@@ -1860,6 +1938,8 @@ class SimulationRenderer:
 		]
 		if self.flow_q is not None:
 			artists.append(self.flow_q)
+		if self.signal_view is not None:
+			artists.extend(self.signal_view.animated_artists())
 		return tuple(artists)
 
 	def animate(self, input_provider: InputProvider | None, replay_txyvv: np.ndarray | None = None, save_replay: str | Path | None = None) -> None:
@@ -1893,22 +1973,23 @@ class SimulationRenderer:
 			if keyboard is not None:
 				keyboard.set_command(np.array([1.0, 0.0], dtype=float), init_vx / max(keyboard.max_speed, 1e-9))
 
-		def _refresh_preview_pose() -> None:
+		def _refresh_preview_pose() -> np.ndarray:
 			orig = self.sim.world_whisker_centers()
-			deff = orig.copy()
+			deff, flow_vel = self.sim._sample_deflected_centers(orig)
 			self._update_mesh_lines(self.orig_mesh_lines, orig)
 			self._update_mesh_lines(self.def_mesh_lines, deff)
 			self._update_whisker_shapes(orig, deff)
 			self.deflection_quiver.set_offsets(orig)
-			zeros = np.zeros(orig.shape[0], dtype=float)
-			self.deflection_quiver.set_UVC(zeros, zeros)
+			delta = deff - orig
+			self.deflection_quiver.set_UVC(delta[:, 0], delta[:, 1])
+			return flow_vel
 
 		center_time_hist: list[float] = []
 		center_xy_hist: list[np.ndarray] = []
 		center_vel_hist: list[np.ndarray] = []
 		whisker_xy_hist: list[np.ndarray] = []
 
-		def _reset_recorded_trajectory() -> None:
+		def _reset_recorded_trajectory(initial_signal_xy: np.ndarray) -> None:
 			center_time_hist.clear()
 			center_xy_hist.clear()
 			center_vel_hist.clear()
@@ -1933,6 +2014,8 @@ class SimulationRenderer:
 			for ln in self.whisker_traj_lines:
 				ln.set_data([], [])
 				ln.set_visible(False)
+			if self.signal_view is not None:
+				self.signal_view.reset(float(self.sim.time), initial_signal_xy)
 			if changed:
 				_redraw_static_after_toggle()
 
@@ -1973,8 +2056,8 @@ class SimulationRenderer:
 		if replay_mode and replay_txyvv is not None and replay_txyvv.shape[0] > 0:
 			_apply_replay_row_to_sim(self.sim, replay_txyvv[0])
 		_set_small_initial_velocity()
-		_refresh_preview_pose()
-		_reset_recorded_trajectory()
+		initial_signal_xy = _refresh_preview_pose()
+		_reset_recorded_trajectory(initial_signal_xy)
 		_set_idle_text()
 
 		def _redraw_static_after_toggle() -> None:
@@ -2067,8 +2150,8 @@ class SimulationRenderer:
 				self.traj_line.set_data([], [])
 
 			_set_idle_text()
-			_refresh_preview_pose()
-			_reset_recorded_trajectory()
+			initial_signal_xy = _refresh_preview_pose()
+			_reset_recorded_trajectory(initial_signal_xy)
 			_redraw_static_after_toggle()
 
 		def _toggle_flow() -> None:
@@ -2193,8 +2276,8 @@ class SimulationRenderer:
 				finished["x_mm"] = None
 				finished["t"] = None
 				_set_idle_text()
-				_refresh_preview_pose()
-				_reset_recorded_trajectory()
+				initial_signal_xy = _refresh_preview_pose()
+				_reset_recorded_trajectory(initial_signal_xy)
 				_hide_flow_and_traj()
 			if event.key == "tab" and len(self.flow_cases) > 1:
 				next_idx = int(np.random.randint(0, len(self.flow_cases)))
@@ -2224,7 +2307,9 @@ class SimulationRenderer:
 					self.sim.profiler.record("tick_total", perf_counter() - tick_started)
 				return self._animated_artists()
 
+			stepped = False
 			if not finished["value"]:
+				flow_vel: np.ndarray | None = None
 				if replay_mode and replay_txyvv is not None:
 					if replay_idx["value"] >= replay_txyvv.shape[0]:
 						finished["value"] = True
@@ -2235,10 +2320,12 @@ class SimulationRenderer:
 						_show_flow_and_traj()
 						orig = self.sim.world_whisker_centers()
 						deff = orig.copy()
+						flow_vel = np.zeros_like(orig)
 					else:
 						row = replay_txyvv[replay_idx["value"]]
 						replay_idx["value"] += 1
-						orig, deff = _apply_replay_row_to_sim(self.sim, row)
+						orig, deff, flow_vel = _apply_replay_row_to_sim(self.sim, row)
+						stepped = True
 				else:
 					if input_provider is None:
 						raise RuntimeError("input_provider is required for non-replay interactive mode")
@@ -2246,7 +2333,8 @@ class SimulationRenderer:
 					cmd = input_provider.read()
 					if self.sim.profiler is not None:
 						self.sim.profiler.record("control_read", perf_counter() - control_started)
-					orig, deff, _ = self.sim.step(cmd)
+					orig, deff, flow_vel = self.sim.step(cmd)
+					stepped = True
 				traj_started = perf_counter()
 				_append_recorded_trajectory(orig)
 				if self.sim.profiler is not None:
@@ -2254,6 +2342,14 @@ class SimulationRenderer:
 			else:
 				orig = self.sim.world_whisker_centers()
 				deff = orig.copy()
+				flow_vel = np.zeros_like(orig)
+
+			if stepped:
+				signal_started = perf_counter()
+				if self.signal_view is not None:
+					self.signal_view.append(float(self.sim.time), flow_vel)
+				if self.sim.profiler is not None:
+					self.sim.profiler.record("render_signal_update", perf_counter() - signal_started)
 
 			if flow_visible["value"]:
 				flow_started = perf_counter()
