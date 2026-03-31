@@ -52,6 +52,7 @@ from matplotlib.axes import Axes
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
 
+from array_signal_overlay_view import ArraySignalOverlayView
 from read_plt import read_plt75
 from signal_history_view import SignalHistoryView
 from visualize_flow import FlowFrame2D, _compute_vorticity, _extract_2d, load_flow_frames
@@ -59,6 +60,7 @@ from visualize_flow import FlowFrame2D, _compute_vorticity, _extract_2d, load_fl
 
 SIGNAL_PANEL_WIDTH_RATIO = 1.0
 MAIN_PANEL_WIDTH_RATIO = 5.5
+RIGHT_PANEL_WIDTH_RATIO = 1.5
 
 
 _pygame_spec = importlib.util.find_spec("pygame")
@@ -1017,7 +1019,7 @@ class WhiskerArraySimulator:
 
 def _save_headless_animation(
 	sim: WhiskerArraySimulator,
-	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]],
+	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]],
 	output_path: str | Path,
 	fps: float,
 	object_traj_xy: np.ndarray | None = None,
@@ -1025,7 +1027,7 @@ def _save_headless_animation(
 ) -> Path:
 	"""Save a compact animation of the headless run.
 
-	Each sampled frame tuple is ``(t, orig_centers, deflected_centers, array_center, heading_rad, whisker_signal_xy)``.
+	Each sampled frame tuple is ``(t, orig_centers, deflected_centers, array_center, array_velocity, heading_rad, whisker_signal_xy)``.
 	Returns the final file path that was written.
 	"""
 	if fps <= 0.0:
@@ -1041,11 +1043,11 @@ def _save_headless_animation(
 		output = output.with_suffix(".mp4")
 		ext = ".mp4"
 
-	fig = plt.figure(figsize=(11.0, 5.6))
+	fig = plt.figure(figsize=(14.0, 5.8))
 	gs = fig.add_gridspec(
 		1,
-		2,
-		width_ratios=[SIGNAL_PANEL_WIDTH_RATIO, MAIN_PANEL_WIDTH_RATIO],
+		3,
+		width_ratios=[SIGNAL_PANEL_WIDTH_RATIO, MAIN_PANEL_WIDTH_RATIO, RIGHT_PANEL_WIDTH_RATIO],
 		wspace=0.04,
 	)
 	# Keep main view large while preserving compact per-whisker signal rows.
@@ -1053,6 +1055,19 @@ def _save_headless_animation(
 	signal_view = SignalHistoryView(num_whiskers=sim.geometry.layout_xy.shape[0])
 	signal_view.create_axes(fig, gs[0, 0])
 	ax = fig.add_subplot(gs[0, 1])
+	right_gs = gs[0, 2].subgridspec(2, 1, hspace=0.08)
+	right_top_ax = fig.add_subplot(right_gs[0, 0])
+	right_top_ax.set_axis_off()
+	overlay_view = ArraySignalOverlayView(
+		layout_xy=sim.geometry.layout_xy,
+		mesh_edges=sim.geometry.mesh_edges,
+		ellipse_major=sim.geometry.ellipse_major,
+		ellipse_minor=sim.geometry.ellipse_minor,
+		deflection_gain=sim.config.deflection_gain,
+		max_deflection=sim.config.max_deflection,
+		signal_color="tab:green",
+	)
+	overlay_view.create_axes(fig, right_gs[1, 0])
 	extent = sim.flow.extent()
 	ax.set_xlim(extent[0], extent[1])
 	ax.set_ylim(extent[2], extent[3])
@@ -1161,11 +1176,13 @@ def _save_headless_animation(
 		ax.legend(loc="upper right", fontsize=8)
 	title = ax.set_title("", fontsize=10)
 	frame_times = np.asarray([frame[0] for frame in sampled_frames], dtype=float)
-	frame_signals = np.stack([frame[5] for frame in sampled_frames], axis=0)
+	frame_signals = np.stack([frame[6] for frame in sampled_frames], axis=0)
+	frame_array_vel = np.stack([frame[4] for frame in sampled_frames], axis=0)
 	signal_view.set_history(frame_times[:1], frame_signals[:1])
+	overlay_view.update(frame_signals[0] - frame_array_vel[0][None, :])
 
 	def _update(frame_idx: int):
-		t, orig, deff, center, heading_rad, _signal_xy = sampled_frames[frame_idx]
+		t, orig, deff, center, array_vel, heading_rad, _signal_xy = sampled_frames[frame_idx]
 		flow_idx = sim.flow._frame_index(t=t, flow_dt=sim.config.flow_dt)
 		f = sim.flow.frames[flow_idx]
 		_decay = sim.flow._decay_factor(t, sim.config.flow_dt)
@@ -1186,6 +1203,7 @@ def _save_headless_animation(
 				whisker_hist[: frame_idx + 1, whisker_idx, 1],
 			)
 		signal_view.set_history(frame_times[: frame_idx + 1], frame_signals[: frame_idx + 1])
+		overlay_view.update(_signal_xy - array_vel[None, :])
 		title.set_text(f"t={t:.1f}s")
 		return (
 			bg,
@@ -1199,6 +1217,7 @@ def _save_headless_animation(
 			center_traj_line,
 			*whisker_traj_lines,
 			*signal_view.animated_artists(),
+			*overlay_view.animated_artists(),
 			title,
 		)
 
@@ -1259,7 +1278,7 @@ def _run_headless_mode(
 	sim.state.velocity = np.array([constant_speed_mps, 0.0], dtype=float)
 	sim.state.heading = 0.0
 
-	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]] = []
+	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]] = []
 	next_save_t = 0.0
 	save_dt = 1.0 / save_fps
 
@@ -1272,6 +1291,7 @@ def _run_headless_mode(
 				initial_orig.copy(),
 				initial_def.copy(),
 				sim.state.position.copy(),
+				sim.state.velocity.copy(),
 				float(sim.state.heading),
 				initial_flow_vel.copy(),
 			)
@@ -1288,6 +1308,7 @@ def _run_headless_mode(
 					orig.copy(),
 					deff.copy(),
 					sim.state.position.copy(),
+					sim.state.velocity.copy(),
 					float(sim.state.heading),
 					flow_vel.copy(),
 				)
@@ -1306,6 +1327,7 @@ def _run_headless_mode(
 					orig.copy(),
 					deff.copy(),
 					sim.state.position.copy(),
+					sim.state.velocity.copy(),
 					float(sim.state.heading),
 					flow_vel.copy(),
 				)
@@ -1462,7 +1484,7 @@ def _run_headless_replay_mode(
 	if save_fps <= 0.0:
 		raise ValueError("save_fps must be positive")
 
-	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]] = []
+	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]] = []
 	next_save_t = float(replay_txyvv[0, 0])
 	save_dt = 1.0 / save_fps
 	last_orig: np.ndarray | None = None
@@ -1484,6 +1506,7 @@ def _run_headless_replay_mode(
 					orig.copy(),
 					deff.copy(),
 					sim.state.position.copy(),
+					sim.state.velocity.copy(),
 					float(sim.state.heading),
 					flow_vel.copy(),
 				)
@@ -1498,6 +1521,7 @@ def _run_headless_replay_mode(
 					last_orig.copy(),
 					last_deff.copy(),
 					sim.state.position.copy(),
+					sim.state.velocity.copy(),
 					last_heading,
 					last_flow_vel.copy(),
 				)
@@ -1735,6 +1759,7 @@ class SimulationRenderer:
 	last_flow_signature: tuple[int, float] | None = field(default=None, init=False)
 	_last_decay_visual_t: float = field(default=-1e18, init=False)
 	signal_view: SignalHistoryView | None = field(default=None, init=False)
+	overlay_view: ArraySignalOverlayView | None = field(default=None, init=False)
 
 	def _build_mesh_lines(self, color: str, lw: float, alpha: float, zorder: int = 2) -> list[Line2D]:
 		return _create_mesh_lines(
@@ -1751,16 +1776,29 @@ class SimulationRenderer:
 
 	def setup(self) -> None:
 		ext = self.sim.flow.extent()
-		self.fig = plt.figure(figsize=(12.0, 7.0))
+		self.fig = plt.figure(figsize=(15.0, 7.0))
 		gs = self.fig.add_gridspec(
 			1,
-			2,
-			width_ratios=[SIGNAL_PANEL_WIDTH_RATIO, MAIN_PANEL_WIDTH_RATIO],
+			3,
+			width_ratios=[SIGNAL_PANEL_WIDTH_RATIO, MAIN_PANEL_WIDTH_RATIO, RIGHT_PANEL_WIDTH_RATIO],
 			wspace=0.04,
 		)
 		self.signal_view = SignalHistoryView(num_whiskers=self.sim.geometry.layout_xy.shape[0])
 		self.signal_view.create_axes(self.fig, gs[0, 0])
 		self.ax = self.fig.add_subplot(gs[0, 1])
+		right_gs = gs[0, 2].subgridspec(2, 1, hspace=0.08)
+		right_top_ax = self.fig.add_subplot(right_gs[0, 0])
+		right_top_ax.set_axis_off()
+		self.overlay_view = ArraySignalOverlayView(
+			layout_xy=self.sim.geometry.layout_xy,
+			mesh_edges=self.sim.geometry.mesh_edges,
+			ellipse_major=self.sim.geometry.ellipse_major,
+			ellipse_minor=self.sim.geometry.ellipse_minor,
+			deflection_gain=self.sim.config.deflection_gain,
+			max_deflection=self.sim.config.max_deflection,
+			signal_color="tab:green",
+		)
+		self.overlay_view.create_axes(self.fig, right_gs[1, 0])
 		manager = getattr(self.fig.canvas, "manager", None)
 		handler_id = getattr(manager, "key_press_handler_id", None)
 		if handler_id is not None:
@@ -1940,6 +1978,8 @@ class SimulationRenderer:
 			artists.append(self.flow_q)
 		if self.signal_view is not None:
 			artists.extend(self.signal_view.animated_artists())
+		if self.overlay_view is not None:
+			artists.extend(self.overlay_view.animated_artists())
 		return tuple(artists)
 
 	def animate(self, input_provider: InputProvider | None, replay_txyvv: np.ndarray | None = None, save_replay: str | Path | None = None) -> None:
@@ -1982,6 +2022,9 @@ class SimulationRenderer:
 			self.deflection_quiver.set_offsets(orig)
 			delta = deff - orig
 			self.deflection_quiver.set_UVC(delta[:, 0], delta[:, 1])
+			if self.overlay_view is not None:
+				rel_vel = flow_vel - self.sim.state.velocity[None, :]
+				self.overlay_view.update(rel_vel)
 			return flow_vel
 
 		center_time_hist: list[float] = []
@@ -2348,6 +2391,9 @@ class SimulationRenderer:
 				signal_started = perf_counter()
 				if self.signal_view is not None:
 					self.signal_view.append(float(self.sim.time), flow_vel)
+				if self.overlay_view is not None:
+					rel_vel = flow_vel - self.sim.state.velocity[None, :]
+					self.overlay_view.update(rel_vel)
 				if self.sim.profiler is not None:
 					self.sim.profiler.record("render_signal_update", perf_counter() - signal_started)
 
@@ -2720,7 +2766,7 @@ if __name__ == "__main__":
 		default=0.2,
 		help="Deflection gain (m per m/s of local flow velocity)",
 	)
-	parser.add_argument("--max-deflection", type=float, default=0.2, help="Maximum whisker tip displacement (m)")
+	parser.add_argument("--max-deflection", type=float, default=0.03, help="Maximum whisker tip displacement (m)")
 	parser.add_argument(
 		"--finish-x-mm",
 		type=float,
