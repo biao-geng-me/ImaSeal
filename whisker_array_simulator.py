@@ -1178,6 +1178,8 @@ def _save_headless_animation(
 	frame_times = np.asarray([frame[0] for frame in sampled_frames], dtype=float)
 	frame_signals = np.stack([frame[6] for frame in sampled_frames], axis=0)
 	frame_array_vel = np.stack([frame[4] for frame in sampled_frames], axis=0)
+	max_frame_signal = float(np.max(np.linalg.norm(frame_signals, axis=2)))
+	overlay_view.set_signal_reference_max(max_frame_signal)
 	signal_view.set_history(frame_times[:1], frame_signals[:1])
 	overlay_view.update(frame_signals[0] - frame_array_vel[0][None, :])
 
@@ -1356,11 +1358,16 @@ def _load_replay_data(
 	time_unit: str = "s",
 	position_unit: str = "m",
 	velocity_unit: str = "m/s",
-) -> np.ndarray:
-	"""Load replay table with 5 columns and convert to SI units.
+) -> tuple[np.ndarray, np.ndarray | None]:
+	"""Load replay table and convert to SI units.
 
-	Input columns are interpreted as ``t, x, y, x_vel, y_vel`` in the units
-	specified by ``time_unit``, ``position_unit``, and ``velocity_unit``.
+	Input columns are interpreted as ``t, x, y, x_vel, y_vel[, ML1, MD1, ...]``
+	in the units specified by ``time_unit``, ``position_unit``, and
+	``velocity_unit``.  If additional ``ML``/``MD`` moment columns are present
+	they are returned as a second array of shape ``(N, n_whiskers, 2)`` where
+	``[:, :, 0]`` is **drag moment** (MD, x-component) and ``[:, :, 1]`` is
+	**lift moment** (ML, y-component).  Returns ``None`` for the signals array
+	when no extra columns are found.
 	"""
 	time_scale_map = {
 		"s": 1.0,
@@ -1412,17 +1419,32 @@ def _load_replay_data(
 	if arr.ndim != 2 or arr.shape[1] < 5:
 		raise ValueError("replay file must be a 2D table with at least 5 columns: t,x,y,x_vel,y_vel")
 
-	arr = arr[:, :5]
-	arr[:, 0] *= time_scale_map[time_unit_norm]
-	arr[:, 1:3] *= position_scale_map[position_unit_norm]
-	arr[:, 3:5] *= velocity_scale_map[velocity_unit_norm]
-	if arr.shape[0] < 1:
+	# Parse optional whisker signal columns (ML1,MD1,ML2,MD2,...) from cols 5+
+	replay_signals: np.ndarray | None = None
+	n_extra = arr.shape[1] - 5
+	if n_extra > 0:
+		if n_extra % 2 != 0:
+			print(f"[replay] ignoring {n_extra} extra signal column(s): expected even count for ML/MD pairs")
+		else:
+			n_whiskers = n_extra // 2
+			extra = arr[:, 5:]  # (N, 2*n_whiskers): [ML1,MD1,ML2,MD2,...]
+			# Reshape to (N, n_whiskers, 2) storing [ML, MD] per whisker
+			paired = extra.reshape(arr.shape[0], n_whiskers, 2)
+			# Reorder to [MD, ML] = [x/drag, y/lift] to match signal_xy convention
+			replay_signals = paired[:, :, [1, 0]]
+			print(f"[replay] loaded whisker signals for {n_whiskers} whiskers (ML=lift y, MD=drag x)")
+
+	txyvv = arr[:, :5].copy()
+	txyvv[:, 0] *= time_scale_map[time_unit_norm]
+	txyvv[:, 1:3] *= position_scale_map[position_unit_norm]
+	txyvv[:, 3:5] *= velocity_scale_map[velocity_unit_norm]
+	if txyvv.shape[0] < 1:
 		raise ValueError("replay file contains no rows")
-	if not np.all(np.isfinite(arr)):
+	if not np.all(np.isfinite(txyvv)):
 		raise ValueError("replay file contains NaN/Inf values")
-	if np.any(np.diff(arr[:, 0]) < 0.0):
+	if np.any(np.diff(txyvv[:, 0]) < 0.0):
 		raise ValueError("replay time column must be nondecreasing")
-	return arr
+	return txyvv, replay_signals
 
 
 def _save_replay_data(replay_txyvv: np.ndarray, output_path: str | Path) -> None:
@@ -1982,7 +2004,7 @@ class SimulationRenderer:
 			artists.extend(self.overlay_view.animated_artists())
 		return tuple(artists)
 
-	def animate(self, input_provider: InputProvider | None, replay_txyvv: np.ndarray | None = None, save_replay: str | Path | None = None) -> None:
+	def animate(self, input_provider: InputProvider | None, replay_txyvv: np.ndarray | None = None, replay_signals: np.ndarray | None = None, save_replay: str | Path | None = None) -> None:
 		self.setup()
 		paused = {"value": True}
 		finished = {"value": False, "x_mm": None, "t": None}
@@ -1996,6 +2018,17 @@ class SimulationRenderer:
 		save_replay_path = Path(save_replay) if save_replay is not None else None
 		save_replay_run = {"value": 0}  # counts completed runs for numbered filenames
 		keyboard = input_provider if isinstance(input_provider, KeyboardInput) else None
+		if self.signal_view is not None:
+			if replay_mode and replay_signals is not None and replay_signals.shape[0] > 0:
+				self.signal_view.set_fixed_limits_from_history(replay_signals)
+			else:
+				self.signal_view.clear_fixed_limits()
+		if self.overlay_view is not None:
+			if replay_mode and replay_signals is not None and replay_signals.shape[0] > 0:
+				replay_max_signal = float(np.max(np.linalg.norm(replay_signals, axis=2)))
+				self.overlay_view.set_signal_reference_max(replay_max_signal)
+			else:
+				self.overlay_view.set_signal_reference_max(None)
 		self.text.set_text("Press space to start")
 		self.bg.set_visible(False)
 		if self.flow_q is not None:
@@ -2100,6 +2133,10 @@ class SimulationRenderer:
 			_apply_replay_row_to_sim(self.sim, replay_txyvv[0])
 		_set_small_initial_velocity()
 		initial_signal_xy = _refresh_preview_pose()
+		if replay_signals is not None and replay_signals.shape[0] > 0:
+			initial_signal_xy = replay_signals[0]
+			if self.overlay_view is not None:
+				self.overlay_view.update(initial_signal_xy)
 		_reset_recorded_trajectory(initial_signal_xy)
 		_set_idle_text()
 
@@ -2320,6 +2357,10 @@ class SimulationRenderer:
 				finished["t"] = None
 				_set_idle_text()
 				initial_signal_xy = _refresh_preview_pose()
+				if replay_signals is not None and replay_signals.shape[0] > 0:
+					initial_signal_xy = replay_signals[0]
+					if self.overlay_view is not None:
+						self.overlay_view.update(initial_signal_xy)
 				_reset_recorded_trajectory(initial_signal_xy)
 				_hide_flow_and_traj()
 			if event.key == "tab" and len(self.flow_cases) > 1:
@@ -2389,11 +2430,19 @@ class SimulationRenderer:
 
 			if stepped:
 				signal_started = perf_counter()
+				# Use CSV whisker signals (ML/MD) if available in replay mode
+				if replay_mode and replay_signals is not None:
+					sig_xy = replay_signals[replay_idx["value"] - 1]
+				else:
+					sig_xy = flow_vel
 				if self.signal_view is not None:
-					self.signal_view.append(float(self.sim.time), flow_vel)
+					self.signal_view.append(float(self.sim.time), sig_xy)
 				if self.overlay_view is not None:
-					rel_vel = flow_vel - self.sim.state.velocity[None, :]
-					self.overlay_view.update(rel_vel)
+					if replay_mode and replay_signals is not None:
+						self.overlay_view.update(sig_xy)
+					else:
+						rel_vel = flow_vel - self.sim.state.velocity[None, :]
+						self.overlay_view.update(rel_vel)
 				if self.sim.profiler is not None:
 					self.sim.profiler.record("render_signal_update", perf_counter() - signal_started)
 
@@ -2551,8 +2600,9 @@ def run_simulation(
 		raise ValueError("save_dpi must be positive")
 
 	replay_txyvv: np.ndarray | None = None
+	replay_signals: np.ndarray | None = None
 	if replay is not None:
-		replay_txyvv = _load_replay_data(
+		replay_txyvv, replay_signals = _load_replay_data(
 			replay,
 			time_unit=replay_time_unit,
 			position_unit=replay_pos_unit,
@@ -2585,6 +2635,15 @@ def run_simulation(
 	else:
 		geometry = WhiskerArrayGeometry.regular_grid(rows=rows, cols=cols, spacing=spacing)
 	ext = flow.extent()
+	if replay_signals is not None:
+		n_array = geometry.layout_xy.shape[0]
+		n_sig = replay_signals.shape[1]
+		if n_sig != n_array:
+			print(
+				f"[replay] WARNING: signal columns have {n_sig} whiskers but array has {n_array}; "
+				"ignoring CSV whisker signals"
+			)
+			replay_signals = None
 	if replay_txyvv is not None and replay_txyvv.shape[0] > 0:
 		first = replay_txyvv[0]
 		init_pos = np.array([float(first[1]), float(first[2])], dtype=float)
@@ -2658,7 +2717,7 @@ def run_simulation(
 	)
 	if replay_txyvv is not None:
 		print("[replay] interactive replay mode enabled")
-		renderer.animate(None, replay_txyvv=replay_txyvv, save_replay=save_replay)
+		renderer.animate(None, replay_txyvv=replay_txyvv, replay_signals=replay_signals, save_replay=save_replay)
 	else:
 		accel_per_frame = max_accel * dt * 0.25
 		provider, provider_name = _build_input_provider(

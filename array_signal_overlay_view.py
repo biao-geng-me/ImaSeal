@@ -23,6 +23,7 @@ class ArraySignalOverlayView:
 	max_deflection: float
 	show_deflection: bool = False
 	view_scale: float = 2.0
+	default_max_signal: float = 1.0
 	signal_color: str = "tab:green"
 	orig_color: str = "tab:grey"
 	def_color: str = "tab:orange"
@@ -33,6 +34,41 @@ class ArraySignalOverlayView:
 	orig_ellipses: list[Ellipse] = field(default_factory=list, init=False)
 	def_ellipses: list[Ellipse] = field(default_factory=list, init=False)
 	signal_quiver: Any | None = field(default=None, init=False)
+	whisker_spacing: float = field(default=0.0, init=False)
+	reference_max_signal: float = field(default=1.0, init=False)
+	quiver_scale: float = field(default=1.0, init=False)
+
+	def _infer_whisker_spacing(self, pts: np.ndarray) -> float:
+		"""Estimate nominal whisker spacing as median nearest-neighbor distance."""
+		n = int(pts.shape[0])
+		if n < 2:
+			return 0.0
+		d = pts[:, None, :] - pts[None, :, :]
+		dist = np.linalg.norm(d, axis=2)
+		np.fill_diagonal(dist, np.inf)
+		nn = np.min(dist, axis=1)
+		nn = nn[np.isfinite(nn) & (nn > 0.0)]
+		if nn.size == 0:
+			return 0.0
+		return float(np.median(nn))
+
+	def _compute_quiver_scale(self) -> float:
+		spacing = float(self.whisker_spacing)
+		ref_max = float(self.reference_max_signal)
+		if spacing <= 1e-12 or ref_max <= 1e-12:
+			return 1.0
+		# For angles="xy" and scale_units="xy", arrow length ~= |U| / scale.
+		# Set scale so max reference signal maps to one whisker spacing.
+		return ref_max / spacing
+
+	def set_signal_reference_max(self, max_signal: float | None) -> None:
+		if max_signal is None or not np.isfinite(max_signal) or float(max_signal) <= 0.0:
+			self.reference_max_signal = max(1e-9, float(self.default_max_signal))
+		else:
+			self.reference_max_signal = float(max_signal)
+		self.quiver_scale = self._compute_quiver_scale()
+		if self.signal_quiver is not None:
+			self.signal_quiver.scale = self.quiver_scale
 
 	def create_axes(self, fig: Figure, parent: SubplotSpec) -> None:
 		self.ax = fig.add_subplot(parent)
@@ -45,6 +81,8 @@ class ArraySignalOverlayView:
 		if orig.ndim != 2 or orig.shape[1] != 2:
 			raise ValueError("layout_xy must be an Nx2 array")
 		n = orig.shape[0]
+		self.whisker_spacing = self._infer_whisker_spacing(orig)
+		self.set_signal_reference_max(None)
 
 		for _ in self.mesh_edges:
 			ln = Line2D([], [], color=self.orig_color, lw=1.2, alpha=0.85, zorder=2)
@@ -87,7 +125,7 @@ class ArraySignalOverlayView:
 			color=self.signal_color,
 			angles="xy",
 			scale_units="xy",
-			scale=3.0,
+			scale=self.quiver_scale,
 			width=0.01,
 			headwidth=2.2,
 			headlength=2.6,

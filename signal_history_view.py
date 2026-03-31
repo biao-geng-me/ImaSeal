@@ -47,6 +47,8 @@ class SignalHistoryView:
 	lift_lines: list[Line2D] = field(default_factory=list, init=False)
 	drag_lines: list[Line2D] = field(default_factory=list, init=False)
 	row_text: list = field(default_factory=list, init=False)
+	fixed_lift_lim: tuple[float, float] | None = field(default=None, init=False)
+	fixed_drag_lim: tuple[float, float] | None = field(default=None, init=False)
 
 	def create_axes(self, fig: Figure, parent: SubplotSpec, width_ratio: float = 1.0) -> None:
 		if self.num_whiskers < 1:
@@ -138,6 +140,17 @@ class SignalHistoryView:
 		self.lift_hist = [row[:, 1].copy() for row in s]
 		self._refresh_lines()
 
+	def clear_fixed_limits(self) -> None:
+		self.fixed_lift_lim = None
+		self.fixed_drag_lim = None
+
+	def set_fixed_limits_from_history(self, signal_hist_xy: np.ndarray) -> None:
+		s = np.asarray(signal_hist_xy, dtype=float)
+		if s.ndim != 3 or s.shape[1:] != (self.num_whiskers, 2):
+			raise ValueError(f"signal_hist_xy must be shape (K, {self.num_whiskers}, 2)")
+		self.fixed_drag_lim = _expand_limits(float(np.min(s[:, :, 0])), float(np.max(s[:, :, 0])))
+		self.fixed_lift_lim = _expand_limits(float(np.min(s[:, :, 1])), float(np.max(s[:, :, 1])))
+
 	def _refresh_lines(self) -> None:
 		if not self.time_hist:
 			return
@@ -145,8 +158,8 @@ class SignalHistoryView:
 		lift = np.asarray(self.lift_hist, dtype=float)
 		drag = np.asarray(self.drag_hist, dtype=float)
 
-		lift_lim = _expand_limits(float(np.min(lift)), float(np.max(lift)))
-		drag_lim = _expand_limits(float(np.min(drag)), float(np.max(drag)))
+		lift_lim = self.fixed_lift_lim or _expand_limits(float(np.min(lift)), float(np.max(lift)))
+		drag_lim = self.fixed_drag_lim or _expand_limits(float(np.min(drag)), float(np.max(drag)))
 
 		for idx in range(self.num_whiskers):
 			self.lift_lines[idx].set_data(t, lift[:, idx])
