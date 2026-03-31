@@ -51,6 +51,7 @@ from matplotlib.animation import FFMpegWriter, FuncAnimation
 from matplotlib.axes import Axes
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
+from matplotlib.widgets import Slider
 
 from array_signal_overlay_view import ArraySignalOverlayView
 from read_plt import read_plt75
@@ -1253,6 +1254,265 @@ def _save_headless_animation(
 	plt.close(fig)
 	print(f"[headless] saved animation: {saved_output}")
 	return saved_output
+
+
+def _run_review_mode(
+	sim: WhiskerArraySimulator,
+	*,
+	replay_txyvv: np.ndarray,
+	replay_signals: np.ndarray | None = None,
+	object_traj_xy: np.ndarray | None = None,
+) -> None:
+	"""Interactive review mode for replay history using slider + frame-step keys."""
+	if replay_txyvv.ndim != 2 or replay_txyvv.shape[1] < 5:
+		raise ValueError("replay_txyvv must be shape (N,5+) with t,x,y,x_vel,y_vel")
+	if replay_txyvv.shape[0] < 1:
+		raise ValueError("replay_txyvv must contain at least one row")
+
+	n_frames = replay_txyvv.shape[0]
+	n_whiskers = sim.geometry.layout_xy.shape[0]
+	if replay_signals is not None:
+		if replay_signals.shape != (n_frames, n_whiskers, 2):
+			raise ValueError(
+				f"replay_signals must be shape ({n_frames}, {n_whiskers}, 2), got {replay_signals.shape}"
+			)
+
+	frame_times = replay_txyvv[:, 0].astype(float)
+	frame_centers = replay_txyvv[:, 1:3].astype(float)
+	frame_array_vel = replay_txyvv[:, 3:5].astype(float)
+
+	frame_orig_list: list[np.ndarray] = []
+	frame_deff_list: list[np.ndarray] = []
+	frame_flow_list: list[np.ndarray] = []
+	for row in replay_txyvv:
+		orig, deff, flow_vel = _apply_replay_row_to_sim(sim, row)
+		frame_orig_list.append(orig.copy())
+		frame_deff_list.append(deff.copy())
+		frame_flow_list.append(flow_vel.copy())
+	frame_orig = np.stack(frame_orig_list, axis=0)
+	frame_deff = np.stack(frame_deff_list, axis=0)
+	frame_flow = np.stack(frame_flow_list, axis=0)
+
+	if replay_signals is not None:
+		signal_hist = replay_signals
+		overlay_hist = replay_signals
+	else:
+		signal_hist = frame_flow
+		overlay_hist = frame_flow - frame_array_vel[:, None, :]
+
+	fig = plt.figure(figsize=(14.0, 6.6))
+	gs = fig.add_gridspec(
+		1,
+		3,
+		width_ratios=[SIGNAL_PANEL_WIDTH_RATIO, MAIN_PANEL_WIDTH_RATIO, RIGHT_PANEL_WIDTH_RATIO],
+		wspace=0.04,
+	)
+	fig.subplots_adjust(left=0.03, right=0.99, bottom=0.13, top=0.95)
+
+	signal_view = SignalHistoryView(num_whiskers=n_whiskers)
+	signal_view.create_axes(fig, gs[0, 0])
+	signal_view.set_fixed_limits_from_history(signal_hist)
+	signal_view.set_history(frame_times, signal_hist)
+	for artist in signal_view.animated_artists():
+		artist.set_animated(False)
+
+	ax = fig.add_subplot(gs[0, 1])
+	right_gs = gs[0, 2].subgridspec(2, 1, hspace=0.08)
+	right_top_ax = fig.add_subplot(right_gs[0, 0])
+	right_top_ax.set_axis_off()
+	overlay_view = ArraySignalOverlayView(
+		layout_xy=sim.geometry.layout_xy,
+		mesh_edges=sim.geometry.mesh_edges,
+		ellipse_major=sim.geometry.ellipse_major,
+		ellipse_minor=sim.geometry.ellipse_minor,
+		deflection_gain=sim.config.deflection_gain,
+		max_deflection=sim.config.max_deflection,
+		signal_color="tab:green",
+	)
+	overlay_view.create_axes(fig, right_gs[1, 0])
+	overlay_view.set_signal_reference_max(float(np.max(np.linalg.norm(overlay_hist, axis=2))))
+	for artist in overlay_view.animated_artists():
+		artist.set_animated(False)
+
+	extent = sim.flow.extent()
+	ax.set_xlim(extent[0], extent[1])
+	ax.set_ylim(extent[2], extent[3])
+	ax.set_aspect("equal")
+	ax.set_xlabel("x (m)")
+	ax.set_ylabel("y (m)")
+
+	f0 = sim.flow.frames[0]
+	vs = 8
+	qstep = 24
+	s = sim.flow.coord_scale
+	x_img = f0.x[::vs] * s
+	y_img = f0.y[::vs] * s
+	x_q = f0.x[::qstep] * s
+	y_q = f0.y[::qstep] * s
+	bg = ax.imshow(
+		f0.vorticity[::vs, ::vs].T,
+		origin="lower",
+		extent=(float(x_img[0]), float(x_img[-1]), float(y_img[0]), float(y_img[-1])),
+		cmap="RdBu_r",
+		vmin=-0.1,
+		vmax=0.1,
+		interpolation="nearest",
+		alpha=0.5,
+	)
+	flow_q = ax.quiver(
+		x_q,
+		y_q,
+		f0.u[::qstep, ::qstep].T,
+		f0.v[::qstep, ::qstep].T,
+		color="0.25",
+		angles="xy",
+		scale_units="xy",
+		scale=6.0,
+		width=0.0015,
+		alpha=0.55,
+	)
+	finish_line = ax.axvline(sim.config.finish_x, color="tab:red", lw=1.1, ls="--", alpha=0.9)
+	(center_dot,) = ax.plot([], [], marker="o", ms=3.0, color="tab:green", lw=0.0)
+	orig_mesh_lines = _create_mesh_lines(
+		ax,
+		sim.geometry.mesh_edges,
+		color="tab:grey",
+		lw=1.5,
+		alpha=0.85,
+		zorder=2,
+	)
+	orig_whiskers: list[Ellipse] = []
+	def_whiskers: list[Ellipse] = []
+	for _ in range(n_whiskers):
+		e_orig = Ellipse((0.0, 0.0), width=sim.geometry.ellipse_major, height=sim.geometry.ellipse_minor)
+		e_orig.set_edgecolor("tab:grey")
+		e_orig.set_facecolor("none")
+		e_orig.set_linewidth(1.2)
+		e_orig.set_zorder(2)
+		ax.add_patch(e_orig)
+		orig_whiskers.append(e_orig)
+
+		e_def = Ellipse((0.0, 0.0), width=sim.geometry.ellipse_major, height=sim.geometry.ellipse_minor)
+		e_def.set_edgecolor("tab:orange")
+		e_def.set_facecolor("none")
+		e_def.set_linewidth(1.0)
+		e_def.set_zorder(4)
+		e_def.set_visible(False)
+		ax.add_patch(e_def)
+		def_whiskers.append(e_def)
+
+	_zeros = np.zeros(n_whiskers)
+	deflection_quiver = ax.quiver(
+		frame_orig[0, :, 0],
+		frame_orig[0, :, 1],
+		_zeros,
+		_zeros,
+		color="tab:red",
+		angles="xy",
+		scale_units="xy",
+		scale=1.0,
+		width=0.002,
+		headwidth=1.4,
+		headlength=1.6,
+		headaxislength=1.6,
+		zorder=3,
+	)
+
+	if object_traj_xy is not None and object_traj_xy.size > 0:
+		ax.plot(
+			object_traj_xy[:, 0],
+			object_traj_xy[:, 1],
+			color="tab:red",
+			lw=1.8,
+			alpha=0.7,
+			zorder=2.5,
+			label="object trajectory",
+		)
+	if object_traj_xy is not None and object_traj_xy.size > 0:
+		ax.legend(loc="upper right", fontsize=8)
+
+	(center_traj_line,) = ax.plot([], [], color="tab:green", lw=1.6, alpha=0.8, zorder=2.6)
+	whisker_traj_lines: list[Line2D] = []
+	for whisker_idx in range(n_whiskers):
+		(ln,) = ax.plot([], [], color="tab:purple", lw=0.9, alpha=0.25, zorder=2.55)
+		whisker_traj_lines.append(ln)
+
+	title = ax.set_title("", fontsize=10)
+	frame_state = {"idx": 0, "in_slider": False}
+
+	def _render_frame(frame_idx: int) -> None:
+		idx = int(np.clip(frame_idx, 0, n_frames - 1))
+		t = float(frame_times[idx])
+		orig = frame_orig[idx]
+		deff = frame_deff[idx]
+		center = frame_centers[idx]
+		array_vel = frame_array_vel[idx]
+		heading_rad = float(np.arctan2(array_vel[1], array_vel[0])) if float(np.hypot(array_vel[0], array_vel[1])) > 1e-9 else 0.0
+		flow_idx = sim.flow._frame_index(t=t, flow_dt=sim.config.flow_dt)
+		f = sim.flow.frames[flow_idx]
+		decay = sim.flow._decay_factor(t, sim.config.flow_dt)
+		bg.set_data(f.vorticity[::vs, ::vs].T * decay)
+		flow_q.set_UVC(f.u[::qstep, ::qstep].T * decay, f.v[::qstep, ::qstep].T * decay)
+		angle_deg = float(np.degrees(heading_rad))
+		_update_mesh_lines_common(orig_mesh_lines, sim.geometry.mesh_edges, orig)
+		_update_whisker_ellipses_common(orig_whiskers, orig, angle_deg)
+		_update_whisker_ellipses_common(def_whiskers, deff, angle_deg)
+		delta = deff - orig
+		deflection_quiver.set_offsets(orig)
+		deflection_quiver.set_UVC(delta[:, 0], delta[:, 1])
+		center_dot.set_data([float(center[0])], [float(center[1])])
+		center_traj_line.set_data(frame_centers[: idx + 1, 0], frame_centers[: idx + 1, 1])
+		for whisker_idx, ln in enumerate(whisker_traj_lines):
+			ln.set_data(frame_orig[: idx + 1, whisker_idx, 0], frame_orig[: idx + 1, whisker_idx, 1])
+		signal_view.set_cursor_index(idx)
+		overlay_view.update(overlay_hist[idx])
+		title.set_text(f"review frame={idx + 1}/{n_frames} | t={t:.3f} s")
+
+	def _set_frame(frame_idx: int, sync_slider: bool = True) -> None:
+		idx = int(np.clip(frame_idx, 0, n_frames - 1))
+		frame_state["idx"] = idx
+		if sync_slider:
+			frame_state["in_slider"] = True
+			frame_slider.set_val(idx)
+			frame_state["in_slider"] = False
+		_render_frame(idx)
+		fig.canvas.draw_idle()
+
+	slider_ax = fig.add_axes([0.16, 0.05, 0.70, 0.03])
+	frame_slider = Slider(
+		ax=slider_ax,
+		label="Frame",
+		valmin=0,
+		valmax=n_frames - 1,
+		valinit=0,
+		valstep=1,
+	)
+
+	def _on_slider(val: float) -> None:
+		if frame_state["in_slider"]:
+			return
+		_set_frame(int(round(val)), sync_slider=False)
+
+	def _on_key(event) -> None:
+		if event.key == "left":
+			_set_frame(frame_state["idx"] - 1)
+		elif event.key == "right":
+			_set_frame(frame_state["idx"] + 1)
+		elif event.key == "pageup":
+			_set_frame(frame_state["idx"] + 8)
+		elif event.key == "pagedown":
+			_set_frame(frame_state["idx"] - 8)
+		elif event.key == "home":
+			_set_frame(0)
+		elif event.key == "end":
+			_set_frame(n_frames - 1)
+		elif event.key == "escape":
+			plt.close(fig)
+
+	frame_slider.on_changed(_on_slider)
+	fig.canvas.mpl_connect("key_press_event", _on_key)
+	_set_frame(0)
+	plt.show()
 
 
 def _run_headless_mode(
@@ -2557,6 +2817,7 @@ def run_simulation(
 	*,
 	array_config: str | Path | None = None,
 	replay: str | Path | None = None,
+	review: str | Path | None = None,
 	replay_time_unit: str = "s",
 	replay_pos_unit: str = "m",
 	replay_vel_unit: str = "m/s",
@@ -2598,6 +2859,10 @@ def run_simulation(
 		raise ValueError("finish_x_mm must be positive")
 	if save_dpi <= 0:
 		raise ValueError("save_dpi must be positive")
+	if replay is not None and review is not None:
+		raise ValueError("--replay and --review are mutually exclusive")
+	if review is not None and headless:
+		raise ValueError("--review is interactive only and cannot be combined with --headless")
 
 	replay_txyvv: np.ndarray | None = None
 	replay_signals: np.ndarray | None = None
@@ -2609,6 +2874,14 @@ def run_simulation(
 			velocity_unit=replay_vel_unit,
 		)
 		print(f"[replay] loaded {replay_txyvv.shape[0]} rows from {Path(replay)}")
+	elif review is not None:
+		replay_txyvv, replay_signals = _load_replay_data(
+			review,
+			time_unit=replay_time_unit,
+			position_unit=replay_pos_unit,
+			velocity_unit=replay_vel_unit,
+		)
+		print(f"[review] loaded {replay_txyvv.shape[0]} rows from {Path(review)}")
 
 	flow_cases, initial_case_idx = _build_flow_cases(
 		data_path=data_path,
@@ -2675,6 +2948,15 @@ def run_simulation(
 	)
 	if replay_txyvv is not None and replay_txyvv.shape[0] > 0:
 		sim.time = float(replay_txyvv[0, 0])
+	if review is not None and replay_txyvv is not None:
+		print("[review] interactive review mode enabled")
+		_run_review_mode(
+			sim,
+			replay_txyvv=replay_txyvv,
+			replay_signals=replay_signals,
+			object_traj_xy=initial_case.traj_xy,
+		)
+		return
 	if save_file is not None and not headless:
 		print("[headless] --save-file provided; enabling headless mode")
 		headless = True
@@ -2758,6 +3040,12 @@ if __name__ == "__main__":
 		type=Path,
 		default=None,
 		help="Replay file with 5 columns: t,x,y,x_vel,y_vel (SI units)",
+	)
+	parser.add_argument(
+		"--review",
+		type=Path,
+		default=None,
+		help="Review mode file: loads full history and enables slider/frame-step inspection",
 	)
 	parser.add_argument(
 		"--replay-time-unit",
@@ -2867,6 +3155,7 @@ if __name__ == "__main__":
 		args.data_path,
 		array_config=args.array_config,
 		replay=args.replay,
+		review=args.review,
 		replay_time_unit=args.replay_time_unit,
 		replay_pos_unit=args.replay_pos_unit,
 		replay_vel_unit=args.replay_vel_unit,

@@ -9,6 +9,7 @@ from matplotlib.figure import Figure
 from matplotlib.gridspec import SubplotSpec
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
+from matplotlib.text import Text
 
 
 @dataclass
@@ -33,6 +34,7 @@ class ArraySignalOverlayView:
 	def_mesh_lines: list[Line2D] = field(default_factory=list, init=False)
 	orig_ellipses: list[Ellipse] = field(default_factory=list, init=False)
 	def_ellipses: list[Ellipse] = field(default_factory=list, init=False)
+	whisker_labels: list[Text] = field(default_factory=list, init=False)
 	signal_quiver: Any | None = field(default=None, init=False)
 	whisker_spacing: float = field(default=0.0, init=False)
 	reference_max_signal: float = field(default=1.0, init=False)
@@ -116,6 +118,20 @@ class ArraySignalOverlayView:
 				self.ax.add_patch(e_def)
 				self.def_ellipses.append(e_def)
 
+		label_dx = max(self.ellipse_major * 0.55, self.whisker_spacing * 0.12, 0.002)
+		label_dy = max(self.ellipse_minor * 0.25, self.whisker_spacing * 0.04, 0.001)
+		for i, p in enumerate(orig):
+			label = self.ax.text(
+				float(p[0] + label_dx),
+				float(p[1] + label_dy),
+				str(i + 1),
+				fontsize=7,
+				color="0.2",
+				zorder=5,
+			)
+			label.set_animated(True)
+			self.whisker_labels.append(label)
+
 		zeros = np.zeros(n, dtype=float)
 		self.signal_quiver = self.ax.quiver(
 			orig[:, 0],
@@ -184,11 +200,18 @@ class ArraySignalOverlayView:
 
 	def animated_artists(self) -> tuple:
 		if self.signal_quiver is None:
-			return tuple(self.orig_mesh_lines + self.def_mesh_lines + self.orig_ellipses + self.def_ellipses)
+			return tuple(
+				self.orig_mesh_lines
+				+ self.def_mesh_lines
+				+ self.orig_ellipses
+				+ self.def_ellipses
+				+ self.whisker_labels
+			)
 		return tuple(
 			self.orig_mesh_lines
 			+ self.def_mesh_lines
 			+ self.orig_ellipses
 			+ self.def_ellipses
+			+ self.whisker_labels
 			+ [self.signal_quiver]
 		)

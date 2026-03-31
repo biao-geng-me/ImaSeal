@@ -47,6 +47,8 @@ class SignalHistoryView:
 	lift_lines: list[Line2D] = field(default_factory=list, init=False)
 	drag_lines: list[Line2D] = field(default_factory=list, init=False)
 	row_text: list = field(default_factory=list, init=False)
+	value_text: list = field(default_factory=list, init=False)
+	cursor_lines: list[Line2D] = field(default_factory=list, init=False)
 	fixed_lift_lim: tuple[float, float] | None = field(default=None, init=False)
 	fixed_drag_lim: tuple[float, float] | None = field(default=None, init=False)
 
@@ -60,11 +62,15 @@ class SignalHistoryView:
 		self.lift_lines.clear()
 		self.drag_lines.clear()
 		self.row_text.clear()
+		self.value_text.clear()
+		self.cursor_lines.clear()
 
 		sub = parent.subgridspec(self.num_whiskers, 1, hspace=0.03)
 		shared_x: Axes | None = None
 		for idx in range(self.num_whiskers):
-			ax_l = fig.add_subplot(sub[idx, 0], sharex=shared_x)
+			# Place whisker 1 at the bottom and increase whisker index upward.
+			row = self.num_whiskers - 1 - idx
+			ax_l = fig.add_subplot(sub[row, 0], sharex=shared_x)
 			if shared_x is None:
 				shared_x = ax_l
 			ax_r = ax_l.twinx()
@@ -80,7 +86,7 @@ class SignalHistoryView:
 			ax_r.spines["left"].set_visible(False)
 			ax_l.grid(True, which="major", axis="both", color="0.85", lw=0.6, alpha=0.8)
 
-			if idx != self.num_whiskers - 1:
+			if idx != 0:
 				ax_l.tick_params(axis="x", labelbottom=False)
 			ax_l.tick_params(axis="y", labelsize=7, pad=1)
 			ax_r.tick_params(axis="y", labelsize=7, pad=1)
@@ -101,14 +107,28 @@ class SignalHistoryView:
 				color="0.25",
 			)
 			label.set_animated(True)
+			value = ax_l.text(
+				0.01,
+				0.98,
+				"L=0.000, D=0.000",
+				transform=ax_l.transAxes,
+				fontsize=7,
+				color="0.20",
+				va="top",
+			)
+			value.set_animated(True)
+			cursor = ax_l.axvline(0.0, color="0.35", lw=0.9, alpha=0.85, ls="--")
+			cursor.set_animated(True)
 
 			self.axes_left.append(ax_l)
 			self.axes_right.append(ax_r)
 			self.lift_lines.append(ln_l)
 			self.drag_lines.append(ln_r)
 			self.row_text.append(label)
+			self.value_text.append(value)
+			self.cursor_lines.append(cursor)
 
-		self.axes_left[-1].set_xlabel(self.time_label, fontsize=8)
+		self.axes_left[0].set_xlabel(self.time_label, fontsize=8)
 
 	def reset(self, t0: float, signal_xy: np.ndarray) -> None:
 		self.time_hist.clear()
@@ -168,5 +188,21 @@ class SignalHistoryView:
 			self.axes_left[idx].set_ylim(*lift_lim)
 			self.axes_right[idx].set_ylim(*drag_lim)
 
+		self.set_cursor_index(len(t) - 1)
+
+	def set_cursor_index(self, index: int) -> None:
+		if not self.time_hist:
+			return
+		idx = int(np.clip(index, 0, len(self.time_hist) - 1))
+		t = np.asarray(self.time_hist, dtype=float)
+		lift = np.asarray(self.lift_hist, dtype=float)
+		drag = np.asarray(self.drag_hist, dtype=float)
+		t_cursor = float(t[idx])
+		for row in range(self.num_whiskers):
+			self.cursor_lines[row].set_xdata([t_cursor, t_cursor])
+			self.value_text[row].set_text(
+				f"L={float(lift[idx, row]):.3f}, D={float(drag[idx, row]):.3f}"
+			)
+
 	def animated_artists(self) -> tuple:
-		return tuple(self.lift_lines + self.drag_lines + self.row_text)
+		return tuple(self.lift_lines + self.drag_lines + self.row_text + self.value_text + self.cursor_lines)
