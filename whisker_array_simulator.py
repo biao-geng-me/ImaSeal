@@ -1015,10 +1015,11 @@ def _save_headless_animation(
 	fps: float,
 	object_traj_xy: np.ndarray | None = None,
 	save_dpi: int = 90,
-) -> None:
+) -> Path:
 	"""Save a compact animation of the headless run.
 
 	Each sampled frame tuple is ``(t, orig_centers, deflected_centers, array_center, heading_rad)``.
+	Returns the final file path that was written.
 	"""
 	if fps <= 0.0:
 		raise ValueError("fps must be positive")
@@ -1190,6 +1191,7 @@ def _save_headless_animation(
 		cache_frame_data=False,
 	)
 
+	saved_output = output
 	if ext == ".gif":
 		anim.save(str(output), writer="pillow", fps=int(round(fps)), dpi=save_dpi)
 	else:
@@ -1202,12 +1204,13 @@ def _save_headless_animation(
 			)
 			anim.save(str(output), writer=writer, dpi=save_dpi)
 		except Exception:
-			fallback = output.with_suffix(".gif")
-			anim.save(str(fallback), writer="pillow", fps=int(round(fps)), dpi=save_dpi)
-			print(f"[headless] ffmpeg unavailable; wrote GIF instead: {fallback}")
+			saved_output = output.with_suffix(".gif")
+			anim.save(str(saved_output), writer="pillow", fps=int(round(fps)), dpi=save_dpi)
+			print(f"[headless] ffmpeg unavailable; wrote GIF instead: {saved_output}")
 
 	plt.close(fig)
-	print(f"[headless] saved animation: {output}")
+	print(f"[headless] saved animation: {saved_output}")
+	return saved_output
 
 
 def _run_headless_mode(
@@ -1277,8 +1280,43 @@ def _run_headless_mode(
 	return
 
 
-def _load_replay_data(replay_path: str | Path) -> np.ndarray:
-	"""Load replay table with 5 columns: t, x, y, x_vel, y_vel (SI units)."""
+def _load_replay_data(
+	replay_path: str | Path,
+	*,
+	time_unit: str = "s",
+	position_unit: str = "m",
+	velocity_unit: str = "m/s",
+) -> np.ndarray:
+	"""Load replay table with 5 columns and convert to SI units.
+
+	Input columns are interpreted as ``t, x, y, x_vel, y_vel`` in the units
+	specified by ``time_unit``, ``position_unit``, and ``velocity_unit``.
+	"""
+	time_scale_map = {
+		"s": 1.0,
+		"ms": 1e-3,
+	}
+	position_scale_map = {
+		"m": 1.0,
+		"mm": 1e-3,
+	}
+	velocity_scale_map = {
+		"m/s": 1.0,
+		"mm/ms": 1.0,
+		"mm/s": 1e-3,
+	}
+
+	time_unit_norm = str(time_unit).strip().lower()
+	position_unit_norm = str(position_unit).strip().lower()
+	velocity_unit_norm = str(velocity_unit).strip().lower()
+
+	if time_unit_norm not in time_scale_map:
+		raise ValueError(f"unsupported replay time unit: {time_unit!r} (supported: s, ms)")
+	if position_unit_norm not in position_scale_map:
+		raise ValueError(f"unsupported replay position unit: {position_unit!r} (supported: m, mm)")
+	if velocity_unit_norm not in velocity_scale_map:
+		raise ValueError(f"unsupported replay velocity unit: {velocity_unit!r} (supported: m/s, mm/ms, mm/s)")
+
 	fp = Path(replay_path)
 	if not fp.is_file():
 		raise ValueError(f"replay file not found: {fp}")
@@ -1290,9 +1328,11 @@ def _load_replay_data(replay_path: str | Path) -> np.ndarray:
 			data = np.loadtxt(fp, delimiter=",", skiprows=1)
 		except Exception:
 			try:
-				data = np.loadtxt(fp)
+				data = np.loadtxt(fp, delimiter=",", dtype=str)
+				data = np.array([[float(x.strip()) for x in row] for row in data])
 			except Exception:
-				data = np.loadtxt(fp, skiprows=1)
+				data = np.loadtxt(fp, delimiter=",", skiprows=1, dtype=str)
+				data = np.array([[float(x.strip()) for x in row] for row in data])
 
 	arr = np.asarray(data, dtype=float)
 	if arr.ndim == 1:
@@ -1303,6 +1343,9 @@ def _load_replay_data(replay_path: str | Path) -> np.ndarray:
 		raise ValueError("replay file must be a 2D table with at least 5 columns: t,x,y,x_vel,y_vel")
 
 	arr = arr[:, :5]
+	arr[:, 0] *= time_scale_map[time_unit_norm]
+	arr[:, 1:3] *= position_scale_map[position_unit_norm]
+	arr[:, 3:5] *= velocity_scale_map[velocity_unit_norm]
 	if arr.shape[0] < 1:
 		raise ValueError("replay file contains no rows")
 	if not np.all(np.isfinite(arr)):
@@ -2323,6 +2366,9 @@ def run_simulation(
 	*,
 	array_config: str | Path | None = None,
 	replay: str | Path | None = None,
+	replay_time_unit: str = "s",
+	replay_pos_unit: str = "m",
+	replay_vel_unit: str = "m/s",
 	save_replay: str | Path | None = None,
 	data_root: str | Path | None = None,
 	traj_path: str | Path | None = None,
@@ -2364,7 +2410,12 @@ def run_simulation(
 
 	replay_txyvv: np.ndarray | None = None
 	if replay is not None:
-		replay_txyvv = _load_replay_data(replay)
+		replay_txyvv = _load_replay_data(
+			replay,
+			time_unit=replay_time_unit,
+			position_unit=replay_pos_unit,
+			velocity_unit=replay_vel_unit,
+		)
 		print(f"[replay] loaded {replay_txyvv.shape[0]} rows from {Path(replay)}")
 
 	flow_cases, initial_case_idx = _build_flow_cases(
@@ -2426,6 +2477,10 @@ def run_simulation(
 	if save_file is not None and not headless:
 		print("[headless] --save-file provided; enabling headless mode")
 		headless = True
+
+	if headless and replay is not None and save_file is None:
+		save_file = Path(replay).with_suffix(".mp4")
+		print(f"[headless] no --save-file provided; defaulting to replay-based output: {save_file}")
 
 	if headless:
 		import matplotlib
@@ -2502,6 +2557,27 @@ if __name__ == "__main__":
 		type=Path,
 		default=None,
 		help="Replay file with 5 columns: t,x,y,x_vel,y_vel (SI units)",
+	)
+	parser.add_argument(
+		"--replay-time-unit",
+		type=str,
+		default="s",
+		choices=("s", "ms"),
+		help="Time unit in replay CSV for t column (default: s)",
+	)
+	parser.add_argument(
+		"--replay-pos-unit",
+		type=str,
+		default="m",
+		choices=("m", "mm"),
+		help="Position unit in replay CSV for x,y columns (default: m)",
+	)
+	parser.add_argument(
+		"--replay-vel-unit",
+		type=str,
+		default="m/s",
+		choices=("m/s", "mm/ms", "mm/s"),
+		help="Velocity unit in replay CSV for x_vel,y_vel columns (default: m/s)",
 	)
 	parser.add_argument(
 		"--save-replay",
@@ -2590,6 +2666,9 @@ if __name__ == "__main__":
 		args.data_path,
 		array_config=args.array_config,
 		replay=args.replay,
+		replay_time_unit=args.replay_time_unit,
+		replay_pos_unit=args.replay_pos_unit,
+		replay_vel_unit=args.replay_vel_unit,
 		save_replay=args.save_replay,
 		data_root=args.data_root,
 		traj_path=args.traj_path,
