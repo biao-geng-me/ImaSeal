@@ -49,7 +49,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FFMpegWriter, FuncAnimation
 from matplotlib.lines import Line2D
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Circle, Ellipse
 
 from read_plt import read_plt75
 from visualize_flow import FlowFrame2D, _compute_vorticity, _extract_2d, load_flow_frames
@@ -1014,6 +1014,8 @@ def _save_headless_animation(
 	output_path: str | Path,
 	fps: float,
 	object_traj_xy: np.ndarray | None = None,
+	object_speed: float = 0.2,
+	object_time_offset: float = 0.0,
 	save_dpi: int = 90,
 ) -> Path:
 	"""Save a compact animation of the headless run.
@@ -1033,6 +1035,9 @@ def _save_headless_animation(
 	if ext not in {".mp4", ".m4v", ".mov", ".gif"}:
 		output = output.with_suffix(".mp4")
 		ext = ".mp4"
+
+	if object_speed <= 0.0:
+		raise ValueError("object_speed must be positive")
 
 	fig, ax = plt.subplots(figsize=(8.0, 4.5))
 	# Keep labels/titles readable while trimming default canvas whitespace.
@@ -1076,6 +1081,21 @@ def _save_headless_animation(
 	)
 	finish_line = ax.axvline(sim.config.finish_x, color="tab:red", lw=1.1, ls="--", alpha=0.9)
 	(center_dot,) = ax.plot([], [], marker="o", ms=3.0, color="tab:green", lw=0.0)
+	object_marker = None
+	object_traj_s = None
+	if object_traj_xy is not None and object_traj_xy.size > 0:
+		# Suggested by Hem: show the tracked object as a small marker on the path.
+		deltas = np.diff(object_traj_xy, axis=0)
+		seg_len = np.linalg.norm(deltas, axis=1)
+		object_traj_s = np.concatenate([[0.0], np.cumsum(seg_len)])
+		object_marker = Circle(
+			(float(object_traj_xy[0, 0]), float(object_traj_xy[0, 1])),
+			radius=0.01,
+			color="tab:blue",
+			alpha=0.9,
+			zorder=3.4,
+		)
+		ax.add_patch(object_marker)
 	orig_mesh_lines = _create_mesh_lines(
 		ax,
 		sim.geometry.mesh_edges,
@@ -1147,9 +1167,11 @@ def _save_headless_animation(
 
 	def _update(frame_idx: int):
 		t, orig, deff, center, heading_rad = sampled_frames[frame_idx]
-		flow_idx = sim.flow._frame_index(t=t, flow_dt=sim.config.flow_dt)
+		# Suggested by Hem: saved replays should sample the delayed flow clock.
+		t_flow = t + sim.config.flow_time_delay
+		flow_idx = sim.flow._frame_index(t=t_flow, flow_dt=sim.config.flow_dt)
 		f = sim.flow.frames[flow_idx]
-		_decay = sim.flow._decay_factor(t, sim.config.flow_dt)
+		_decay = sim.flow._decay_factor(t_flow, sim.config.flow_dt)
 		bg.set_data(f.vorticity[::vs, ::vs].T * _decay)
 		flow_q.set_UVC(f.u[::qstep, ::qstep].T * _decay, f.v[::qstep, ::qstep].T * _decay)
 		angle_deg = float(np.degrees(heading_rad))
@@ -1160,13 +1182,25 @@ def _save_headless_animation(
 		deflection_quiver.set_offsets(orig)
 		deflection_quiver.set_UVC(delta[:, 0], delta[:, 1])
 		center_dot.set_data([float(center[0])], [float(center[1])])
+		if object_marker is not None and object_traj_s is not None:
+			# Suggested by Hem: allow the object to lead the whisker by a fixed time offset.
+			obj_t = float(t) + float(object_time_offset)
+			if obj_t < 0.0:
+				object_marker.set_visible(False)
+			else:
+				s_target = min(float(object_traj_s[-1]), obj_t * float(object_speed))
+				obj_x = float(np.interp(s_target, object_traj_s, object_traj_xy[:, 0]))
+				obj_y = float(np.interp(s_target, object_traj_s, object_traj_xy[:, 1]))
+				object_marker.center = (obj_x, obj_y)
+				object_marker.set_visible(True)
 		center_traj_line.set_data(center_hist[: frame_idx + 1, 0], center_hist[: frame_idx + 1, 1])
 		for whisker_idx, ln in enumerate(whisker_traj_lines):
 			ln.set_data(
 				whisker_hist[: frame_idx + 1, whisker_idx, 0],
 				whisker_hist[: frame_idx + 1, whisker_idx, 1],
 			)
-		title.set_text(f"t={t:.1f}s")
+		# Suggested by Hem: display whisker time and flow time separately in the render.
+		title.set_text(f"whisker_t={t:.1f}s | flow_t={t_flow:.1f}s")
 		return (
 			bg,
 			flow_q,
@@ -1223,6 +1257,8 @@ def _run_headless_mode(
 	start_xy_m: tuple[float, float] = (0.150, 0.500),
 	constant_speed_mps: float = 0.2,
 	object_traj_xy: np.ndarray | None = None,
+	object_speed: float = 0.2,
+	object_time_offset: float = 0.0,
 ) -> None:
 	"""Deterministic, non-interactive simulation runner for testing and export."""
 	if sample_rate_hz <= 0.0:
@@ -1268,6 +1304,8 @@ def _run_headless_mode(
 			output_path=save_file,
 			fps=save_fps,
 			object_traj_xy=object_traj_xy,
+			object_speed=object_speed,
+			object_time_offset=object_time_offset,
 			save_dpi=save_dpi,
 		)
 
@@ -1407,6 +1445,8 @@ def _run_headless_replay_mode(
 	save_fps: float = 10.0,
 	save_dpi: int = 90,
 	object_traj_xy: np.ndarray | None = None,
+	object_speed: float = 0.2,
+	object_time_offset: float = 0.0,
 ) -> None:
 	"""Headless non-interactive runner driven by replay rows until replay end-time."""
 	if replay_txyvv.shape[0] < 1:
@@ -1440,6 +1480,8 @@ def _run_headless_replay_mode(
 			output_path=save_file,
 			fps=save_fps,
 			object_traj_xy=object_traj_xy,
+			object_speed=object_speed,
+			object_time_offset=object_time_offset,
 			save_dpi=save_dpi,
 		)
 
@@ -2392,6 +2434,8 @@ def run_simulation(
 	save_file: str | Path | None = None,
 	save_fps: float = 10.0,
 	save_dpi: int = 90,
+	object_speed: float = 0.2,
+	object_time_offset: float = 0.0,
 ) -> None:
 	"""Entry point for whisker-array simulation."""
 
@@ -2494,6 +2538,8 @@ def run_simulation(
 				save_fps=save_fps,
 				save_dpi=save_dpi,
 				object_traj_xy=initial_case.traj_xy,
+				object_speed=object_speed,
+				object_time_offset=object_time_offset,
 			)
 		else:
 			_run_headless_mode(
@@ -2503,6 +2549,8 @@ def run_simulation(
 				save_fps=save_fps,
 				save_dpi=save_dpi,
 				object_traj_xy=initial_case.traj_xy,
+				object_speed=object_speed,
+				object_time_offset=object_time_offset,
 			)
 		print(f'Headless mode done in {perf_counter() - start:.3f} s')
 		return
@@ -2660,6 +2708,20 @@ if __name__ == "__main__":
 		default=90,
 		help="DPI for saved animation (default: 90; 6.4x4.2 in figure gives 576x378 px at 90 dpi)",
 	)
+	parser.add_argument(
+		"--object-speed",
+		type=float,
+		default=0.2,
+		# Suggested by Hem: expose the object speed without changing the base code path.
+		help="Object speed along the path in m/s (default: 0.2)",
+	)
+	parser.add_argument(
+		"--object-time-offset",
+		type=float,
+		default=0.0,
+		# Suggested by Hem: expose the lead/lag offset for replay visualization.
+		help="Time offset (s) for the object relative to whisker time; positive = object ahead",
+	)
 	args = parser.parse_args()
 
 	run_simulation(
@@ -2692,4 +2754,6 @@ if __name__ == "__main__":
 		save_file=args.save_file,
 		save_fps=args.save_fps,
 		save_dpi=args.save_dpi,
+		object_speed=args.object_speed,
+		object_time_offset=args.object_time_offset,
 	)
