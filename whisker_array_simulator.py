@@ -43,11 +43,12 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import Protocol
+from typing import Any, Protocol
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FFMpegWriter, FuncAnimation
+from matplotlib.axes import Axes
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
 
@@ -65,6 +66,33 @@ else:
 
 
 Vec2 = np.ndarray
+_VORTICITY_FIELD_NAMES: tuple[str, ...] = ("vorticity", "vor", "omega", "wz", "curlz")
+
+
+def _maybe_extract_zone_vorticity(zone: object) -> np.ndarray | None:
+	"""Return a 2D vorticity-like field from a Tecplot zone when present."""
+	for name in _VORTICITY_FIELD_NAMES:
+		try:
+			return _extract_2d(zone, name)
+		except KeyError:
+			continue
+	return None
+
+
+def _compute_or_reuse_vorticity(
+	x: np.ndarray,
+	y: np.ndarray,
+	u: np.ndarray,
+	v: np.ndarray,
+	stored_vorticity: np.ndarray | None = None,
+) -> np.ndarray:
+	"""Reuse stored vorticity when available; otherwise compute it from velocity."""
+	if stored_vorticity is not None:
+		arr = np.asarray(stored_vorticity, dtype=float)
+		if arr.shape != u.shape:
+			raise ValueError(f"stored vorticity shape {arr.shape} does not match velocity shape {u.shape}")
+		return arr
+	return _compute_vorticity(x, y, u, v)
 
 
 @dataclass
@@ -605,25 +633,225 @@ class FlowFieldSequence:
 	frames: list[FlowFrame2D]
 	coord_scale: float = 1e-3  # flow grid mm → simulator m
 	decay_half_life: float = 0.0  # 0 = no decay; >0 = half-life in seconds for flow past last real frame
+	_h5_handle: Any | None = None
+	_h5_u: Any | None = None
+	_h5_v: Any | None = None
+	_h5_w: Any | None = None
+	_h5_x: np.ndarray | None = None
+	_h5_y: np.ndarray | None = None
+	_h5_nframes: int = 0
+	_h5_cache: dict[int, FlowFrame2D] = field(default_factory=dict)
+	_h5_cache_limit: int = 3
+
+	@staticmethod
+	def _load_frames_from_hdf5(h5_path: str | Path, *, last_only: bool = False) -> list[FlowFrame2D]:
+		"""Load flow frame(s) from an HDF5 file written by plt_to_hdf5.py."""
+		try:
+			import h5py
+		except Exception as exc:
+			raise RuntimeError("h5py is required to read --flow-h5 input. Install with: pip install h5py") from exc
+
+		# Register optional compression filters (e.g., ZFP) if available.
+		try:
+			import hdf5plugin  # noqa: F401
+		except Exception:
+			pass
+
+		path = Path(h5_path)
+		if not path.is_file():
+			raise FileNotFoundError(f"HDF5 flow file not found: {path}")
+
+		with h5py.File(path, "r") as hf:
+			if "grid" not in hf or "fields" not in hf:
+				raise ValueError(f"Invalid flow HDF5 format in {path}: missing 'grid' or 'fields' group")
+
+			grid = hf["grid"]
+			fields = hf["fields"]
+
+			x_name = "xc" if "xc" in grid else ("x" if "x" in grid else None)
+			y_name = "yc" if "yc" in grid else ("y" if "y" in grid else None)
+			if x_name is None or y_name is None:
+				raise ValueError(f"Invalid flow HDF5 format in {path}: grid must contain xc/yc or x/y")
+
+			x_arr = np.asarray(grid[x_name], dtype=float)
+			y_arr = np.asarray(grid[y_name], dtype=float)
+			if x_arr.ndim == 2:
+				x = np.asarray(x_arr[:, 0], dtype=float)
+			elif x_arr.ndim == 1:
+				x = np.asarray(x_arr, dtype=float)
+			else:
+				raise ValueError(f"Unsupported x-grid shape in {path}: {x_arr.shape}")
+			if y_arr.ndim == 2:
+				y = np.asarray(y_arr[0, :], dtype=float)
+			elif y_arr.ndim == 1:
+				y = np.asarray(y_arr, dtype=float)
+			else:
+				raise ValueError(f"Unsupported y-grid shape in {path}: {y_arr.shape}")
+
+			if "u" not in fields or "v" not in fields:
+				raise ValueError(f"Invalid flow HDF5 format in {path}: fields must contain both 'u' and 'v'")
+			u_ds = fields["u"]
+			v_ds = fields["v"]
+			w_name = next((name for name in _VORTICITY_FIELD_NAMES if name in fields), None)
+			w_ds = fields[w_name] if w_name is not None else None
+			if u_ds.ndim != 3 or v_ds.ndim != 3:
+				raise ValueError(f"Invalid flow HDF5 format in {path}: u/v datasets must be 3D (nframes, ni, nj)")
+			if u_ds.shape != v_ds.shape:
+				raise ValueError(f"Invalid flow HDF5 format in {path}: u and v shapes differ ({u_ds.shape} vs {v_ds.shape})")
+			if w_ds is not None and w_ds.shape != u_ds.shape:
+				raise ValueError(f"Invalid flow HDF5 format in {path}: {w_name} shape differs from u/v ({w_ds.shape} vs {u_ds.shape})")
+
+			nframes = int(u_ds.shape[0])
+			if nframes < 1:
+				raise ValueError(f"No frames found in HDF5 flow file: {path}")
+
+			if last_only:
+				idxs = [nframes - 1]
+			else:
+				idxs = list(range(nframes))
+
+			frames: list[FlowFrame2D] = []
+			for idx in idxs:
+				u = np.asarray(u_ds[idx], dtype=float)
+				v = np.asarray(v_ds[idx], dtype=float)
+				stored_w = np.asarray(w_ds[idx], dtype=float) if w_ds is not None else None
+				w = _compute_or_reuse_vorticity(x, y, u, v, stored_vorticity=stored_w)
+				frames.append(FlowFrame2D(name=f"{path.name}#{idx}", x=x, y=y, u=u, v=v, vorticity=w))
+
+			return frames
+
+	@staticmethod
+	def _open_hdf5_lazy(h5_path: str | Path) -> tuple[Any, Any, Any, Any | None, np.ndarray, np.ndarray, int]:
+		"""Open an HDF5 flow file and return lightweight handles for lazy frame reads."""
+		try:
+			import h5py
+		except Exception as exc:
+			raise RuntimeError("h5py is required to read --flow-h5 input. Install with: pip install h5py") from exc
+
+		try:
+			import hdf5plugin  # noqa: F401
+		except Exception:
+			pass
+
+		path = Path(h5_path)
+		if not path.is_file():
+			raise FileNotFoundError(f"HDF5 flow file not found: {path}")
+
+		hf = h5py.File(path, "r")
+		if "grid" not in hf or "fields" not in hf:
+			hf.close()
+			raise ValueError(f"Invalid flow HDF5 format in {path}: missing 'grid' or 'fields' group")
+
+		grid = hf["grid"]
+		fields = hf["fields"]
+		x_name = "xc" if "xc" in grid else ("x" if "x" in grid else None)
+		y_name = "yc" if "yc" in grid else ("y" if "y" in grid else None)
+		if x_name is None or y_name is None:
+			hf.close()
+			raise ValueError(f"Invalid flow HDF5 format in {path}: grid must contain xc/yc or x/y")
+		if "u" not in fields or "v" not in fields:
+			hf.close()
+			raise ValueError(f"Invalid flow HDF5 format in {path}: fields must contain both 'u' and 'v'")
+
+		x_arr = np.asarray(grid[x_name], dtype=float)
+		y_arr = np.asarray(grid[y_name], dtype=float)
+		if x_arr.ndim == 2:
+			x = np.asarray(x_arr[:, 0], dtype=float)
+		elif x_arr.ndim == 1:
+			x = np.asarray(x_arr, dtype=float)
+		else:
+			hf.close()
+			raise ValueError(f"Unsupported x-grid shape in {path}: {x_arr.shape}")
+		if y_arr.ndim == 2:
+			y = np.asarray(y_arr[0, :], dtype=float)
+		elif y_arr.ndim == 1:
+			y = np.asarray(y_arr, dtype=float)
+		else:
+			hf.close()
+			raise ValueError(f"Unsupported y-grid shape in {path}: {y_arr.shape}")
+
+		u_ds = fields["u"]
+		v_ds = fields["v"]
+		w_name = next((name for name in _VORTICITY_FIELD_NAMES if name in fields), None)
+		w_ds = fields[w_name] if w_name is not None else None
+		if u_ds.ndim != 3 or v_ds.ndim != 3:
+			hf.close()
+			raise ValueError(f"Invalid flow HDF5 format in {path}: u/v datasets must be 3D (nframes, ni, nj)")
+		if u_ds.shape != v_ds.shape:
+			hf.close()
+			raise ValueError(f"Invalid flow HDF5 format in {path}: u and v shapes differ ({u_ds.shape} vs {v_ds.shape})")
+		if w_ds is not None and w_ds.shape != u_ds.shape:
+			hf.close()
+			raise ValueError(f"Invalid flow HDF5 format in {path}: {w_name} shape differs from u/v ({w_ds.shape} vs {u_ds.shape})")
+
+		nframes = int(u_ds.shape[0])
+		if nframes < 1:
+			hf.close()
+			raise ValueError(f"No frames found in HDF5 flow file: {path}")
+
+		return hf, u_ds, v_ds, w_ds, x, y, nframes
+
+	def _frame_count(self) -> int:
+		if self._h5_nframes > 0:
+			return self._h5_nframes
+		return len(self.frames)
+
+	@property
+	def nframes(self) -> int:
+		return self._frame_count()
+
+	def get_frame_by_index(self, idx: int) -> FlowFrame2D:
+		n = self._frame_count()
+		if n <= 0:
+			raise ValueError("No flow frames available")
+		idx = int(np.clip(idx, 0, n - 1))
+
+		if self._h5_nframes <= 0:
+			return self.frames[idx]
+
+		cached = self._h5_cache.get(idx)
+		if cached is not None:
+			return cached
+
+		if self._h5_u is None or self._h5_v is None or self._h5_x is None or self._h5_y is None:
+			raise RuntimeError("HDF5 flow backend is not initialized")
+
+		u = np.asarray(self._h5_u[idx])
+		v = np.asarray(self._h5_v[idx])
+		stored_w = np.asarray(self._h5_w[idx], dtype=float) if self._h5_w is not None else None
+		w = _compute_or_reuse_vorticity(self._h5_x, self._h5_y, u, v, stored_vorticity=stored_w)
+		frame = FlowFrame2D(name=f"h5#{idx}", x=self._h5_x, y=self._h5_y, u=u, v=v, vorticity=w)
+		self._h5_cache[idx] = frame
+		if len(self._h5_cache) > self._h5_cache_limit:
+			oldest_idx = next(iter(self._h5_cache.keys()))
+			if oldest_idx != idx:
+				self._h5_cache.pop(oldest_idx, None)
+		return frame
 
 	@staticmethod
 	def from_last_frame(data_path: str | Path, coord_scale: float = 1e-3) -> "FlowFieldSequence":
-		"""Load only the last Q.*.plt file for a static flow field (fast startup)."""
+		"""Load a static flow field from last Q.*.plt or from the last frame in a .h5 file."""
 		root = Path(data_path)
+		_t0 = perf_counter()
+		if root.is_file() and root.suffix.lower() in {".h5", ".hdf5"}:
+			frames = FlowFieldSequence._load_frames_from_hdf5(root, last_only=True)
+			print(f"[flow] loaded single frame from HDF5: {root.name} ({perf_counter() - _t0:.3f} s)")
+			return FlowFieldSequence(frames=frames, coord_scale=coord_scale)
+
 		files = sorted(root.glob("Q.*.plt"))
 		if not files:
 			raise ValueError(f"No Q.*.plt files found in {root}")
 		fp = files[-1]
-		_t0 = perf_counter()
 		parsed = read_plt75(fp)
 		zone = parsed.zones[0]
 		xc = _extract_2d(zone, "xc")
 		yc = _extract_2d(zone, "yc")
 		u = _extract_2d(zone, "u")
 		v = _extract_2d(zone, "v")
+		stored_w = _maybe_extract_zone_vorticity(zone)
 		x = np.asarray(xc[:, 0], dtype=float)
 		y = np.asarray(yc[0, :], dtype=float)
-		w = _compute_vorticity(x, y, u, v)
+		w = _compute_or_reuse_vorticity(x, y, u, v, stored_vorticity=stored_w)
 		frame = FlowFrame2D(name=fp.name, x=x, y=y, u=u, v=v, vorticity=w)
 		print(f"[flow] loaded single frame: {fp.name} ({perf_counter() - _t0:.3f} s)")
 		return FlowFieldSequence(frames=[frame], coord_scale=coord_scale)
@@ -642,7 +870,25 @@ class FlowFieldSequence:
 			raise ValueError("decay_half_life must be >= 0")
 
 		_t0 = perf_counter()
-		frames = load_flow_frames(data_path)
+		root = Path(data_path)
+		if root.is_file() and root.suffix.lower() in {".h5", ".hdf5"}:
+			hf, u_ds, v_ds, w_ds, x, y, nframes = FlowFieldSequence._open_hdf5_lazy(root)
+			flow = FlowFieldSequence(
+				frames=[],
+				coord_scale=coord_scale,
+				decay_half_life=decay_half_life,
+				_h5_handle=hf,
+				_h5_u=u_ds,
+				_h5_v=v_ds,
+				_h5_w=w_ds,
+				_h5_x=x,
+				_h5_y=y,
+				_h5_nframes=nframes,
+			)
+			print(f"[flow] loaded {flow.nframes} frame(s) from '{data_path}' ({perf_counter() - _t0:.3f} s)")
+			return flow
+		else:
+			frames = load_flow_frames(data_path)
 		if not frames:
 			raise ValueError("No flow frames found")
 		print(f"[flow] loaded {len(frames)} frame(s) from '{data_path}' ({perf_counter() - _t0:.3f} s)")
@@ -650,12 +896,12 @@ class FlowFieldSequence:
 		return FlowFieldSequence(frames=frames, coord_scale=coord_scale, decay_half_life=decay_half_life)
 
 	def _frame_index(self, t: float, flow_dt: float) -> int:
-		n = len(self.frames)
+		n = self._frame_count()
 		idx = int(np.floor(t / flow_dt))
 		return min(max(idx, 0), n - 1)
 
 	def _frame_blend_indices(self, t: float, flow_dt: float) -> tuple[int, int, float]:
-		n = len(self.frames)
+		n = self._frame_count()
 		if n <= 1:
 			return 0, 0, 0.0
 		if flow_dt <= 0.0:
@@ -673,7 +919,7 @@ class FlowFieldSequence:
 		return i0, i1, alpha
 
 	def _decay_factor(self, t: float, flow_dt: float) -> float:
-		n = len(self.frames)
+		n = self._frame_count()
 		if self.decay_half_life <= 0.0 or n <= 0:
 			return 1.0
 		t_end = (n - 1) * flow_dt
@@ -684,23 +930,23 @@ class FlowFieldSequence:
 	def frame_signature(self, t: float, flow_dt: float) -> tuple[int, float]:
 		"""Return (frame_idx, 1.0) normally, or (n-1, -1.0) as stable sentinel during decay."""
 		if self._decay_factor(t=t, flow_dt=flow_dt) < 1.0:
-			return len(self.frames) - 1, -1.0
+			return self._frame_count() - 1, -1.0
 		return self._frame_index(t=t, flow_dt=flow_dt), 1.0
 
 	def _sample_grid_uv(self, t: float, flow_dt: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-		n = len(self.frames)
+		n = self._frame_count()
 		if self.decay_half_life > 0.0 and n > 0:
 			t_end = (n - 1) * flow_dt
 			if t > t_end:
 				decay_factor = float(0.5 ** (float(t - t_end) / self.decay_half_life))
-				f = self.frames[-1]
+				f = self.get_frame_by_index(n - 1)
 				u = f.u * decay_factor
 				v = f.v * decay_factor
 				w = _compute_vorticity(f.x, f.y, u, v)
 				return u, v, w
 		i0, i1, alpha = self._frame_blend_indices(t=t, flow_dt=flow_dt)
-		f0 = self.frames[i0]
-		f1 = self.frames[i1]
+		f0 = self.get_frame_by_index(i0)
+		f1 = self.get_frame_by_index(i1)
 		if i0 == i1 or alpha <= 0.0:
 			return f0.u, f0.v, f0.vorticity
 		u = (1.0 - alpha) * f0.u + alpha * f1.u
@@ -712,12 +958,12 @@ class FlowFieldSequence:
 		self, t: float, flow_dt: float, profiler: StepProfiler | None
 	) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 		"""Sample flow grid with optional step-by-step profiling of vorticity computation."""
-		n = len(self.frames)
+		n = self._frame_count()
 		if self.decay_half_life > 0.0 and n > 0:
 			t_end = (n - 1) * flow_dt
 			if t > t_end:
 				decay_factor = float(0.5 ** (float(t - t_end) / self.decay_half_life))
-				f = self.frames[-1]
+				f = self.get_frame_by_index(n - 1)
 				u = f.u * decay_factor
 				v = f.v * decay_factor
 				vort_start = perf_counter()
@@ -728,8 +974,8 @@ class FlowFieldSequence:
 
 		interp_start = perf_counter()
 		i0, i1, alpha = self._frame_blend_indices(t=t, flow_dt=flow_dt)
-		f0 = self.frames[i0]
-		f1 = self.frames[i1]
+		f0 = self.get_frame_by_index(i0)
+		f1 = self.get_frame_by_index(i1)
 		if i0 == i1 or alpha <= 0.0:
 			if profiler is not None:
 				profiler.record("flow_grid_interp", perf_counter() - interp_start)
@@ -748,7 +994,7 @@ class FlowFieldSequence:
 	def sample_frame(self, t: float, flow_dt: float) -> FlowFrame2D:
 		"""Return the current raw frame (clamped to last when data ends; no decay applied)."""
 		idx, _ = self.frame_signature(t=t, flow_dt=flow_dt)
-		return self.frames[idx]
+		return self.get_frame_by_index(idx)
 
 	def _fractional_indices_from_world(
 		self,
@@ -822,21 +1068,22 @@ class FlowFieldSequence:
 
 	def sample_velocity(self, world_xy: np.ndarray, t: float, flow_dt: float) -> np.ndarray:
 		# Temporal interpolation applied only to sampled whisker points (not the full grid).
-		x = self.frames[0].x
-		y = self.frames[0].y
+		f_ref = self.get_frame_by_index(0)
+		x = f_ref.x
+		y = f_ref.y
 		_, _, x0, x1, y0, y1, sx, sy = self._fractional_indices_from_world(world_xy, x=x, y=y)
 
 		decay = self._decay_factor(t=t, flow_dt=flow_dt)
 		if decay < 1.0:
-			v_last = self._sample_velocity_from_indices(self.frames[-1], x0, x1, y0, y1, sx, sy)
+			v_last = self._sample_velocity_from_indices(self.get_frame_by_index(self._frame_count() - 1), x0, x1, y0, y1, sx, sy)
 			return v_last * decay
 
 		i0, i1, alpha = self._frame_blend_indices(t=t, flow_dt=flow_dt)
-		f0 = self.frames[i0]
+		f0 = self.get_frame_by_index(i0)
 		if i0 == i1 or alpha <= 0.0:
 			return self._sample_velocity_from_indices(f0, x0, x1, y0, y1, sx, sy)
 
-		f1 = self.frames[i1]
+		f1 = self.get_frame_by_index(i1)
 		v0 = self._sample_velocity_from_indices(f0, x0, x1, y0, y1, sx, sy)
 		v1 = self._sample_velocity_from_indices(f1, x0, x1, y0, y1, sx, sy)
 		return (1.0 - alpha) * v0 + alpha * v1
@@ -848,7 +1095,7 @@ class FlowFieldSequence:
 
 	def extent(self) -> tuple[float, float, float, float]:
 		"""Return (xmin, xmax, ymin, ymax) in simulator units (m)."""
-		f0 = self.frames[0]
+		f0 = self.get_frame_by_index(0)
 		s = self.coord_scale
 		return float(f0.x[0]) * s, float(f0.x[-1]) * s, float(f0.y[0]) * s, float(f0.y[-1]) * s
 
@@ -1044,7 +1291,7 @@ def _save_headless_animation(
 	ax.set_xlabel("x (m)")
 	ax.set_ylabel("y (m)")
 
-	f0 = sim.flow.frames[0]
+	f0 = sim.flow.get_frame_by_index(0)
 	vs = 8
 	qstep = 24
 	s = sim.flow.coord_scale
@@ -1148,7 +1395,7 @@ def _save_headless_animation(
 	def _update(frame_idx: int):
 		t, orig, deff, center, heading_rad = sampled_frames[frame_idx]
 		flow_idx = sim.flow._frame_index(t=t, flow_dt=sim.config.flow_dt)
-		f = sim.flow.frames[flow_idx]
+		f = sim.flow.get_frame_by_index(flow_idx)
 		_decay = sim.flow._decay_factor(t, sim.config.flow_dt)
 		bg.set_data(f.vorticity[::vs, ::vs].T * _decay)
 		flow_q.set_UVC(f.u[::qstep, ::qstep].T * _decay, f.v[::qstep, ::qstep].T * _decay)
@@ -1519,6 +1766,34 @@ def _discover_numbered_flow_paths(root: Path, excluded_ids: set[int] | None = No
 	return [p for _, p in items]
 
 
+def _discover_numbered_h5_paths(
+	root: Path, h5_name: str, excluded_ids: set[int] | None = None
+) -> list[Path]:
+	"""Find path<number> folders containing an H5 file matching *h5_name* (glob pattern allowed).
+
+	Returns a numerically sorted list of resolved H5 file paths (one per folder, first match).
+	"""
+	if not root.is_dir():
+		return []
+	excluded_ids = excluded_ids if excluded_ids is not None else set()
+	items: list[tuple[int, Path]] = []
+	for child in root.iterdir():
+		if not child.is_dir():
+			continue
+		if not child.name.lower().startswith("path"):
+			continue
+		idx = _numeric_suffix(child.name)
+		if idx is None:
+			continue
+		if idx in excluded_ids:
+			continue
+		matches = sorted(child.glob(h5_name))
+		if matches:
+			items.append((idx, matches[0]))
+	items.sort(key=lambda it: it[0])
+	return [p for _, p in items]
+
+
 def _choose_flow_index(cases: list[FlowCase], current_idx: int) -> int | None:
 	"""Open a small listbox dialog and return selected case index, or None on cancel."""
 	if not cases:
@@ -1569,11 +1844,34 @@ def _choose_flow_index(cases: list[FlowCase], current_idx: int) -> int | None:
 
 def _build_flow_cases(
 	data_path: str | Path | None,
+	flow_h5: str | Path | None,
 	data_root: str | Path | None,
 	traj_path: str | Path | None,
 	exclude_list: str | Path | None,
+	common_h5: str | None = None,
 ) -> tuple[list[FlowCase], int]:
 	"""Build selectable flow cases and return (cases, initial_index)."""
+	if flow_h5 is not None and data_path is not None:
+		raise ValueError("Specify only one of data_path and flow_h5")
+
+	if flow_h5 is not None:
+		h5_path = Path(flow_h5)
+		if not h5_path.is_file():
+			raise ValueError(f"flow_h5 does not exist: {h5_path}")
+		if h5_path.suffix.lower() not in {".h5", ".hdf5"}:
+			raise ValueError(f"flow_h5 must be a .h5 or .hdf5 file: {h5_path}")
+		traj_dir: Path | None = None
+		if traj_path is not None:
+			cand = Path(traj_path)
+			if cand.is_dir():
+				traj_dir = cand
+		if traj_dir is None:
+			cand = h5_path.parent.parent / "xy_data"
+			if cand.is_dir():
+				traj_dir = cand
+		traj_xy = _load_matching_trajectory(h5_path.parent, traj_dir) if traj_dir is not None else None
+		return [FlowCase(label=h5_path.stem, data_path=h5_path, traj_xy=traj_xy)], 0
+
 	selected_path = Path(data_path) if data_path is not None else None
 
 	# Resolve trajectory directory first: explicit arg wins, otherwise sibling xy_data.
@@ -1589,11 +1887,25 @@ def _build_flow_cases(
 		parent = selected_path.parent
 		exclude_file = Path(exclude_list) if exclude_list is not None else (parent / "exclude_list.txt")
 		excluded_ids = _load_excluded_path_ids(exclude_file)
-		numbered = _discover_numbered_flow_paths(parent, excluded_ids=excluded_ids)
 		if traj_dir is None:
 			cand = parent / "xy_data"
 			if cand.is_dir():
 				traj_dir = cand
+
+		if common_h5 is not None:
+			h5_paths = _discover_numbered_h5_paths(parent, common_h5, excluded_ids=excluded_ids)
+			# Find which H5 path belongs to selected_path folder
+			initial_idx = next(
+				(i for i, p in enumerate(h5_paths) if p.parent == selected_path), 0
+			)
+			cases: list[FlowCase] = []
+			for h5_path in h5_paths:
+				folder = h5_path.parent
+				traj_xy = _load_matching_trajectory(folder, traj_dir) if traj_dir is not None else None
+				cases.append(FlowCase(label=folder.name, data_path=h5_path, traj_xy=traj_xy))
+			return cases, initial_idx
+
+		numbered = _discover_numbered_flow_paths(parent, excluded_ids=excluded_ids)
 
 		if numbered and selected_path in numbered:
 			paths = numbered
@@ -1605,16 +1917,29 @@ def _build_flow_cases(
 		root = Path(data_root) if data_root is not None else Path("flowdata") / "env1"
 		exclude_file = Path(exclude_list) if exclude_list is not None else (root / "exclude_list.txt")
 		excluded_ids = _load_excluded_path_ids(exclude_file)
-		paths = _discover_numbered_flow_paths(root, excluded_ids=excluded_ids)
-		if not paths:
-			raise ValueError(f"No eligible path<number> directories with Q.*.plt found in {root}")
 		if traj_dir is None:
 			cand = root / "xy_data"
 			if cand.is_dir():
 				traj_dir = cand
+
+		if common_h5 is not None:
+			h5_paths = _discover_numbered_h5_paths(root, common_h5, excluded_ids=excluded_ids)
+			if not h5_paths:
+				raise ValueError(f"No eligible path<number> directories with '{common_h5}' found in {root}")
+			initial_idx = int(np.random.randint(0, len(h5_paths)))
+			cases = []
+			for h5_path in h5_paths:
+				folder = h5_path.parent
+				traj_xy = _load_matching_trajectory(folder, traj_dir) if traj_dir is not None else None
+				cases.append(FlowCase(label=folder.name, data_path=h5_path, traj_xy=traj_xy))
+			return cases, initial_idx
+
+		paths = _discover_numbered_flow_paths(root, excluded_ids=excluded_ids)
+		if not paths:
+			raise ValueError(f"No eligible path<number> directories with Q.*.plt found in {root}")
 		initial_idx = int(np.random.randint(0, len(paths)))
 
-	cases: list[FlowCase] = []
+	cases = []
 	for path in paths:
 		traj_xy = _load_matching_trajectory(path, traj_dir) if traj_dir is not None else None
 		cases.append(FlowCase(label=path.name, data_path=path, traj_xy=traj_xy))
@@ -1701,7 +2026,7 @@ class SimulationRenderer:
 			zorder=1.5,
 		)
 
-		f0 = self.sim.flow.frames[0]
+		f0 = self.sim.flow.get_frame_by_index(0)
 		vs = self.vort_step
 		s = self.sim.flow.coord_scale
 		x_img = f0.x[::vs] * s
@@ -1741,6 +2066,7 @@ class SimulationRenderer:
 
 		# Trajectory sits beneath everything else (zorder=1), hidden by default.
 		(self.traj_line,) = self.ax.plot([], [], color="tab:red", lw=4, alpha=0.5, zorder=1, visible=False)
+		self.traj_line.set_animated(True)
 		(self.array_center_traj_line,) = self.ax.plot([], [], color="tab:green", lw=1.8, alpha=0.7, zorder=1.1, visible=False)
 		if self.flow_cases:
 			xy = self.flow_cases[self.current_case_idx].traj_xy
@@ -1819,7 +2145,7 @@ class SimulationRenderer:
 			# Decay period: rate-limit visual updates to 1 FPS; apply decay to subsampled slices.
 			if t - self._last_decay_visual_t < 1.0:
 				return
-			frame = self.sim.flow.frames[-1]
+			frame = self.sim.flow.get_frame_by_index(self.sim.flow.nframes - 1)
 			self.bg.set_data(frame.vorticity[::vs, ::vs].T * decay)
 			if self.flow_q is not None:
 				self.flow_q.set_UVC(
@@ -1851,6 +2177,7 @@ class SimulationRenderer:
 	def _animated_artists(self) -> tuple:
 		artists: list = [
 			self.bg,
+			self.traj_line,
 			*self.orig_mesh_lines,
 			*self.def_mesh_lines,
 			*self.whisker_orig,
@@ -2026,7 +2353,7 @@ class SimulationRenderer:
 			dy = ymax - ymin
 			self.text.set_position((xmin + 0.5 * dx, ymax - 0.015 * dy))
 
-			f0 = self.sim.flow.frames[0]
+			f0 = self.sim.flow.get_frame_by_index(0)
 			vs = self.vort_step
 			s = self.sim.flow.coord_scale
 			x_img = f0.x[::vs] * s
@@ -2364,6 +2691,8 @@ def _build_input_provider(
 def run_simulation(
 	data_path: str | Path | None = None,
 	*,
+	flow_h5: str | Path | None = None,
+	common_h5: str | None = None,
 	array_config: str | Path | None = None,
 	replay: str | Path | None = None,
 	replay_time_unit: str = "s",
@@ -2420,21 +2749,23 @@ def run_simulation(
 
 	flow_cases, initial_case_idx = _build_flow_cases(
 		data_path=data_path,
+		flow_h5=flow_h5,
 		data_root=data_root,
 		traj_path=traj_path,
 		exclude_list=exclude_list,
+		common_h5=common_h5,
 	)
 	if not flow_cases:
 		raise ValueError("No valid flow cases found")
 	initial_case = flow_cases[initial_case_idx]
-	if dynamic_flow and data_path is not None:
+	if dynamic_flow and data_path is not None and common_h5 is None:
 		flow_cases = [initial_case]
 		initial_case_idx = 0
 	print(f"[flow] launch case: {initial_case.label} ({initial_case.data_path})")
 
 	if dynamic_flow:
 		flow = FlowFieldSequence.from_path(initial_case.data_path, flow_dt=flow_dt, decay_half_life=flow_decay)
-		print(f"[flow] dynamic time series enabled ({len(flow.frames)} real frames)")
+		print(f"[flow] dynamic time series enabled ({flow.nframes} real frames)")
 	else:
 		flow = FlowFieldSequence.from_last_frame(initial_case.data_path)
 	if array_config is not None:
@@ -2539,6 +2870,18 @@ if __name__ == "__main__":
 		help="Specific directory containing Q.*.plt files (if omitted, pick random from --data-root)",
 	)
 	parser.add_argument(
+		"--flow-h5",
+		type=Path,
+		default=None,
+		help="Specific .h5/.hdf5 flow file generated by plt_to_hdf5.py; overrides path discovery",
+	)
+	parser.add_argument(
+		"--common-h5",
+		type=str,
+		default=None,
+		help="H5 filename (or glob, e.g. 'vel_4e-1.h5') present in each path<N> folder under --data-root; use with --dynamic-flow to enable tab-switching between H5 flow cases",
+	)
+	parser.add_argument(
 		"--data-root",
 		type=Path,
 		default=Path("flowdata") / "env1",
@@ -2588,7 +2931,7 @@ if __name__ == "__main__":
 	parser.add_argument(
 		"--dynamic-flow",
 		action="store_true",
-		help="Load and use all Q.*.plt frames as a time series with temporal interpolation",
+		help="Load and use all time frames (Q.*.plt folder or HDF5 file) with temporal interpolation",
 	)
 	parser.add_argument(
 		"--flow-decay",
@@ -2664,6 +3007,8 @@ if __name__ == "__main__":
 
 	run_simulation(
 		args.data_path,
+		flow_h5=args.flow_h5,
+		common_h5=args.common_h5,
 		array_config=args.array_config,
 		replay=args.replay,
 		replay_time_unit=args.replay_time_unit,
