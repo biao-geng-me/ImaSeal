@@ -33,6 +33,9 @@ Controls:
 	- Tab: reset with a new randomly selected flow path
 	- Enter/Return: open flow path selector and reset with chosen path
   - Esc: close
+- Chase mode (--chase [x_vel]):
+  - Constant x velocity, user controls y with Up/Down arrows
+  - Initial y position taken from the object trajectory start (if available)
 """
 
 from __future__ import annotations
@@ -293,6 +296,53 @@ class KeyboardInput:
 			self._throttle = max(0.0, self._throttle - throttle_step)
 
 		return ControllerCommand(direction=self._direction.copy(), throttle=self._throttle)
+
+	def shutdown(self) -> None:
+		return
+
+
+@dataclass
+class ChaseInput:
+	"""Chase mode: constant x velocity, user-controlled y velocity via up/down arrows.
+
+	Left/right arrows, throttle keys, and gamepad are all ignored.
+	``max_speed`` is used only to bound ``vy`` to ±max_speed.
+	"""
+
+	chase_x_vel: float = 0.15
+	max_speed: float = 0.4
+	accel_per_frame: float = 0.008
+	pressed: set[str] = field(default_factory=set)
+	_vy: float = 0.0
+
+	def on_key_press(self, key: str) -> None:
+		self.pressed.add(key)
+
+	def on_key_release(self, key: str) -> None:
+		self.pressed.discard(key)
+
+	def reset(self) -> None:
+		self.pressed.clear()
+		self._vy = 0.0
+
+	def set_command(self, direction: np.ndarray, throttle: float) -> None:
+		"""Ignored in chase mode — x velocity is always chase_x_vel."""
+		pass
+
+	def read(self) -> ControllerCommand:
+		if "up" in self.pressed:
+			self._vy = min(self._vy + self.accel_per_frame, self.max_speed)
+		if "down" in self.pressed:
+			self._vy = max(self._vy - self.accel_per_frame, -self.max_speed)
+		vx = self.chase_x_vel
+		vy = self._vy
+		vel = np.array([vx, vy], dtype=float)
+		speed = float(np.linalg.norm(vel))
+		if speed < 1e-12:
+			return ControllerCommand(direction=np.array([1.0, 0.0], dtype=float), throttle=0.0)
+		direction = vel / speed
+		throttle = float(np.clip(speed / max(self.max_speed, 1e-9), 0.0, 1.0))
+		return ControllerCommand(direction=direction, throttle=throttle)
 
 	def shutdown(self) -> None:
 		return
@@ -2192,7 +2242,7 @@ class SimulationRenderer:
 	def animate(self, input_provider: InputProvider | None, replay_txyvv: np.ndarray | None = None, save_replay: str | Path | None = None) -> None:
 		self.setup()
 		paused = {"value": True}
-		finished = {"value": False, "x_mm": None, "t": None}
+		finished = {"value": False, "x_mm": None, "t": None, "revealed": False}
 		flow_visible = {"value": False}
 		traj_visible = {"value": False}
 		base_visible = {"value": True}
@@ -2203,6 +2253,8 @@ class SimulationRenderer:
 		save_replay_path = Path(save_replay) if save_replay is not None else None
 		save_replay_run = {"value": 0}  # counts completed runs for numbered filenames
 		keyboard = input_provider if isinstance(input_provider, KeyboardInput) else None
+		chase_input = input_provider if isinstance(input_provider, ChaseInput) else None
+		chase_mode = chase_input is not None
 		self.text.set_text("Press space to start")
 		self.bg.set_visible(False)
 		if self.flow_q is not None:
@@ -2210,10 +2262,19 @@ class SimulationRenderer:
 		profile_reported = {"value": False}
 
 		def _set_idle_text() -> None:
-			self.text.set_text("Press space to start | F1: Help")
+			if chase_mode:
+				self.text.set_text("Chase mode | Press space to start | Up/Down: steer | F1: Help")
+			else:
+				self.text.set_text("Press space to start | F1: Help")
 
 		def _set_small_initial_velocity() -> None:
 			if replay_mode:
+				return
+			if chase_mode:
+				# Chase mode: set velocity to the configured chase x speed.
+				self.sim.state.velocity = np.array([float(chase_input.chase_x_vel), 0.0], dtype=float)
+				if chase_input is not None:
+					chase_input.reset()
 				return
 			init_vx = float(min(0.1, self.sim.config.max_speed * 0.3))
 			self.sim.state.velocity = np.array([init_vx, 0.0], dtype=float)
@@ -2336,15 +2397,20 @@ class SimulationRenderer:
 				self.last_flow_signature = None
 				self._last_decay_visual_t = -1e18
 			self.sim.reset()
+			if chase_mode:
+				new_traj = case.traj_xy
+				if new_traj is not None and new_traj.shape[0] > 0:
+					self.sim.state.position = np.array([float(new_traj[0, 0]), float(new_traj[0, 1])], dtype=float)
 			if keyboard is not None:
 				keyboard.reset()
+			if chase_input is not None:
+				chase_input.reset()
 			_set_small_initial_velocity()
 			paused["value"] = True
 			finished["value"] = False
 			finished["x_mm"] = None
 			finished["t"] = None
-
-			# Update map extent and backdrop artists for the newly loaded flow grid.
+			finished["revealed"] = False
 			ext = self.sim.flow.extent()
 			self.ax.set_xlim(ext[0], ext[1])
 			self.ax.set_ylim(ext[2], ext[3])
@@ -2457,14 +2523,21 @@ class SimulationRenderer:
 			self.deflection_quiver.set_visible(arrows_visible["value"])
 
 		def _show_help_popup() -> None:
-			help_text = (
-				"Whisker Simulator Controls\n"
-				"\n"
+			movement_section = (
+				"Movement (Chase Mode)\n"
+				"  Space           Start/Pause\n"
+				"  Up/Down Arrows  Steer y velocity\n"
+			) if chase_mode else (
 				"Movement\n"
 				"  Space           Start/Pause\n"
 				"  Page Up / X     Accelerate\n"
 				"  Page Down / Z   Brake\n"
 				"  Arrow Keys      Turn heading by 5 deg toward key direction\n"
+			)
+			help_text = (
+				"Whisker Simulator Controls\n"
+				"\n"
+				+ movement_section +
 				"\n"
 				"Layers\n"
 				"  W  Toggle base whisker layer (original mesh/whiskers)\n"
@@ -2493,6 +2566,8 @@ class SimulationRenderer:
 		def _on_press(event) -> None:
 			if keyboard is not None and event.key is not None:
 				keyboard.on_key_press(event.key)
+			if chase_input is not None and event.key is not None:
+				chase_input.on_key_press(event.key)
 			if event.key is not None and event.key.lower() == "f1":
 				_show_help_popup()
 			if event.key == " ":
@@ -2509,20 +2584,31 @@ class SimulationRenderer:
 				_toggle_traj()
 			if event.key in ("r", "R"):
 				self.sim.reset()
+				if chase_mode:
+					traj_xy = self.flow_cases[self.current_case_idx].traj_xy
+					if traj_xy is not None and traj_xy.shape[0] > 0:
+						self.sim.state.position = np.array([float(traj_xy[0, 0]), float(traj_xy[0, 1])], dtype=float)
 				replay_idx["value"] = 0
 				if replay_mode and replay_txyvv is not None and replay_txyvv.shape[0] > 0:
 					_apply_replay_row_to_sim(self.sim, replay_txyvv[0])
 				if keyboard is not None:
 					keyboard.reset()
+				if chase_input is not None:
+					chase_input.reset()
 				_set_small_initial_velocity()
 				paused["value"] = True
 				finished["value"] = False
 				finished["x_mm"] = None
 				finished["t"] = None
+				finished["revealed"] = False
 				_set_idle_text()
 				_refresh_preview_pose()
 				_reset_recorded_trajectory()
 				_hide_flow_and_traj()
+			if event.key == "/" and chase_mode and finished["value"] and not finished.get("revealed", True):
+				finished["revealed"] = True
+				_reveal_recorded_trajectory()
+				_show_flow_and_traj()
 			if event.key == "tab" and len(self.flow_cases) > 1:
 				next_idx = int(np.random.randint(0, len(self.flow_cases)))
 				if next_idx == self.current_case_idx:
@@ -2538,6 +2624,8 @@ class SimulationRenderer:
 		def _on_release(event) -> None:
 			if keyboard is not None and event.key is not None:
 				keyboard.on_key_release(event.key)
+			if chase_input is not None and event.key is not None:
+				chase_input.on_key_release(event.key)
 
 		self.fig.canvas.mpl_connect("key_press_event", _on_press)
 		self.fig.canvas.mpl_connect("key_release_event", _on_release)
@@ -2611,9 +2699,11 @@ class SimulationRenderer:
 				finished["value"] = True
 				finished["x_mm"] = x_center * 1000.0
 				finished["t"] = self.sim.time
+				finished["revealed"] = False
 				self.sim.state.velocity[:] = 0.0
-				_reveal_recorded_trajectory()
-				_show_flow_and_traj()
+				if not chase_mode:
+					_reveal_recorded_trajectory()
+					_show_flow_and_traj()
 			if finished["value"]:
 				text_started = perf_counter()
 				pos = self.sim.state.position
@@ -2626,10 +2716,16 @@ class SimulationRenderer:
 						f"pos=({pos[0]:.3f}, {pos[1]:.3f}) m | vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | Press R to replay | F1: Help"
 					)
 				else:
-					self.text.set_text(
-						f"Finished at x={float(finished['x_mm']):.1f} mm, t={float(finished['t']):.2f} s | "
-						f"pos=({pos[0]:.3f}, {pos[1]:.3f}) m | vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | Press R to restart | F1: Help"
-					)
+					if chase_mode and not finished.get("revealed", True):
+						self.text.set_text(
+							f"Finished at x={float(finished['x_mm']):.1f} mm, t={float(finished['t']):.2f} s | "
+							f"Press R to retry | Tab for random flow | / to reveal | F1: Help"
+						)
+					else:
+						self.text.set_text(
+							f"Finished at x={float(finished['x_mm']):.1f} mm, t={float(finished['t']):.2f} s | "
+							f"pos=({pos[0]:.3f}, {pos[1]:.3f}) m | vel={v_mag:.3f} m/s @ {v_deg:.1f} deg | Press R to restart | F1: Help"
+						)
 				if self.sim.profiler is not None:
 					self.sim.profiler.record("text_update", perf_counter() - text_started)
 					self.sim.profiler.record("tick_total", perf_counter() - tick_started)
@@ -2721,6 +2817,8 @@ def run_simulation(
 	save_file: str | Path | None = None,
 	save_fps: float = 10.0,
 	save_dpi: int = 90,
+	chase_x_vel: float | None = None,
+	chase_accel: float | None = None,
 ) -> None:
 	"""Entry point for whisker-array simulation."""
 
@@ -2746,6 +2844,11 @@ def run_simulation(
 			velocity_unit=replay_vel_unit,
 		)
 		print(f"[replay] loaded {replay_txyvv.shape[0]} rows from {Path(replay)}")
+
+	if chase_x_vel is not None:
+		dynamic_flow = True
+		if common_h5 is None:
+			common_h5 = "vel_4e-1.h5"
 
 	flow_cases, initial_case_idx = _build_flow_cases(
 		data_path=data_path,
@@ -2774,6 +2877,7 @@ def run_simulation(
 	else:
 		geometry = WhiskerArrayGeometry.regular_grid(rows=rows, cols=cols, spacing=spacing)
 	ext = flow.extent()
+	chase_mode = chase_x_vel is not None
 	if replay_txyvv is not None and replay_txyvv.shape[0] > 0:
 		first = replay_txyvv[0]
 		init_pos = np.array([float(first[1]), float(first[2])], dtype=float)
@@ -2781,6 +2885,15 @@ def run_simulation(
 		init_speed = float(np.linalg.norm(init_vel))
 		init_heading = float(np.arctan2(init_vel[1], init_vel[0])) if init_speed > 1e-9 else 0.0
 		state = ArrayState(position=init_pos, velocity=init_vel, heading=init_heading)
+	elif chase_mode:
+		traj_xy = initial_case.traj_xy
+		if traj_xy is not None and traj_xy.shape[0] > 0:
+			init_pos = np.array([float(traj_xy[0, 0]), float(traj_xy[0, 1])], dtype=float)
+			print(f"[chase] initial position from trajectory: ({init_pos[0]:.3f}, {init_pos[1]:.3f}) m")
+		else:
+			init_pos = np.array([0.05, float((ext[2] + ext[3]) * 0.5)], dtype=float)
+			print(f"[chase] no trajectory; initial position: ({init_pos[0]:.3f}, {init_pos[1]:.3f}) m")
+		state = ArrayState(position=init_pos, velocity=np.array([float(chase_x_vel), 0.0], dtype=float), heading=0.0)
 	else:
 		init_pos = np.array([0.05, float(np.random.uniform(ext[2], ext[3]))], dtype=float)
 		init_vx = float(min(0.03, max_speed * 0.1))
@@ -2850,12 +2963,22 @@ def run_simulation(
 		renderer.animate(None, replay_txyvv=replay_txyvv, save_replay=save_replay)
 	else:
 		accel_per_frame = max_accel * dt * 0.25
-		provider, provider_name = _build_input_provider(
-			prefer_gamepad=prefer_gamepad,
-			max_speed=max_speed,
-			accel_per_frame=accel_per_frame,
-		)
-		print(f"[input] using {provider_name}")
+		if chase_mode:
+			chase_accel_per_frame = float(chase_accel) if chase_accel is not None else accel_per_frame * 8
+			print(f'[input] chase mode accel {chase_accel_per_frame}')
+			provider: InputProvider = ChaseInput(
+				chase_x_vel=float(chase_x_vel),
+				max_speed=max_speed,
+				accel_per_frame=chase_accel_per_frame,
+			)
+			print(f"[input] chase mode (x_vel={float(chase_x_vel):.3f} m/s, up/down for y)")
+		else:
+			provider, provider_name = _build_input_provider(
+				prefer_gamepad=prefer_gamepad,
+				max_speed=max_speed,
+				accel_per_frame=accel_per_frame,
+			)
+			print(f"[input] using {provider_name}")
 		renderer.animate(provider, save_replay=save_replay)
 
 
@@ -2893,7 +3016,7 @@ if __name__ == "__main__":
 		default=None,
 		help="Text file listing path indices to exclude (default: <data-root>/exclude_list.txt)",
 	)
-	parser.add_argument("--fps", type=float, default=10.0, help="Simulation step rate in Hz for both interactive and headless modes (default: 10)")
+	parser.add_argument("--fps", type=float, default=25.0, help="Simulation step rate in Hz for both interactive and headless modes (default: 25)")
 	parser.add_argument("--flow-dt", type=float, default=0.04, help="Time spacing of flow frames (s)")
 	parser.add_argument(
 		"--replay",
@@ -2959,8 +3082,8 @@ if __name__ == "__main__":
 		default=None,
 		help="Single YAML file defining unit_arrays (+ optional instances), or layout_xy/grid params; overrides --rows/--cols/--spacing",
 	)
-	parser.add_argument("--max-speed", type=float, default=0.2, help="Maximum commanded speed (m/s)")
-	parser.add_argument("--max-accel", type=float, default=0.2, help="Per-axis acceleration limit (m/s^2)")
+	parser.add_argument("--max-speed", type=float, default=0.4, help="Maximum commanded speed (m/s)")
+	parser.add_argument("--max-accel", type=float, default=0.4, help="Per-axis acceleration limit (m/s^2)")
 	parser.add_argument(
 		"--deflection-gain",
 		type=float,
@@ -2975,6 +3098,21 @@ if __name__ == "__main__":
 		help="Finish line x-position (mm); simulation stops when center reaches it",
 	)
 	parser.add_argument("--traj-path", type=Path, default=None, help="Directory containing *.dat trajectory files (x,y columns in mm)")
+	parser.add_argument(
+		"--chase",
+		metavar="X_VEL",
+		type=float,
+		nargs="?",
+		const=0.15,
+		default=None,
+		help="Enable chase mode: constant x velocity (default 0.15 m/s), up/down arrows control y velocity",
+	)
+	parser.add_argument(
+		"--accel",
+		type=float,
+		default=None,
+		help="Chase mode y-axis acceleration per frame (m/s per frame); default is 4x the normal accel",
+	)
 	parser.add_argument(
 		"--keyboard-only",
 		action="store_true",
@@ -3037,4 +3175,6 @@ if __name__ == "__main__":
 		save_file=args.save_file,
 		save_fps=args.save_fps,
 		save_dpi=args.save_dpi,
+		chase_x_vel=args.chase,
+		chase_accel=args.accel,
 	)

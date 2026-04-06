@@ -12,3 +12,6 @@ Asked Copilot to write `plt_to_hdf5.py` to convert the `Q.*.plt` case folders in
 
 Ran benchmarks on `env1/path1` (272 frames, 2048×1024, ~20 GB raw). Lossy ZFP at `accuracy=1e-1` compresses the full field to 134 MB (119×) with a mean error under `5e-4`. Velocity-only at the same accuracy is 83 MB. Results are documented in `doc/zfp_benchmark.md`. 
 
+## 2026-4-5
+
+Vibe-coded Chase mode.
