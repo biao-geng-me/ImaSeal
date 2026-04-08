@@ -6,4 +6,4 @@ __pycache__/
 flowdata/
 *.mp4
 *.gif
-episode_observations
+episode_observations/
