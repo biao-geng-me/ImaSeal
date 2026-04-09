@@ -1424,6 +1424,7 @@ def _save_headless_animation(
 	fps: float,
 	object_traj_xy: np.ndarray | None = None,
 	save_dpi: int = 90,
+	signals_are_overlay: bool = False,
 ) -> Path:
 	"""Save a compact animation of the headless run.
 
@@ -1581,7 +1582,10 @@ def _save_headless_animation(
 	max_frame_signal = float(np.max(np.linalg.norm(frame_signals, axis=2)))
 	overlay_view.set_signal_reference_max(max_frame_signal)
 	signal_view.set_history(frame_times[:1], frame_signals[:1])
-	overlay_view.update(frame_signals[0] - frame_array_vel[0][None, :])
+	if signals_are_overlay:
+		overlay_view.update(frame_signals[0])
+	else:
+		overlay_view.update(frame_signals[0] - frame_array_vel[0][None, :])
 
 	def _update(frame_idx: int):
 		t, orig, deff, center, array_vel, heading_rad, _signal_xy = sampled_frames[frame_idx]
@@ -1606,7 +1610,10 @@ def _save_headless_animation(
 				whisker_hist[: frame_idx + 1, whisker_idx, 1],
 			)
 		signal_view.set_history(frame_times[: frame_idx + 1], frame_signals[: frame_idx + 1])
-		overlay_view.update(_signal_xy - array_vel[None, :])
+		if signals_are_overlay:
+			overlay_view.update(_signal_xy)
+		else:
+			overlay_view.update(_signal_xy - array_vel[None, :])
 		title.set_text(f"t={t:.1f}s")
 		return (
 			bg,
@@ -2156,6 +2163,7 @@ def _run_headless_replay_mode(
 	sim: WhiskerArraySimulator,
 	*,
 	replay_txyvv: np.ndarray,
+	replay_signals: np.ndarray | None = None,
 	save_file: str | Path | None = None,
 	save_fps: float = 10.0,
 	save_dpi: int = 90,
@@ -2166,6 +2174,11 @@ def _run_headless_replay_mode(
 		raise ValueError("replay_txyvv must contain at least one row")
 	if save_fps <= 0.0:
 		raise ValueError("save_fps must be positive")
+	if replay_signals is not None:
+		n_whiskers = sim.geometry.layout_xy.shape[0]
+		expected = (replay_txyvv.shape[0], n_whiskers, 2)
+		if replay_signals.shape != expected:
+			raise ValueError(f"replay_signals must be shape {expected}, got {replay_signals.shape}")
 
 	sampled_frames: list[tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]] = []
 	next_save_t = float(replay_txyvv[0, 0])
@@ -2173,14 +2186,15 @@ def _run_headless_replay_mode(
 	last_orig: np.ndarray | None = None
 	last_deff: np.ndarray | None = None
 	last_heading: float | None = None
-	last_flow_vel: np.ndarray | None = None
+	last_signal_xy: np.ndarray | None = None
 
-	for row in replay_txyvv:
+	for row_idx, row in enumerate(replay_txyvv):
 		orig, deff, flow_vel = _apply_replay_row_to_sim(sim, row)
+		signal_xy = replay_signals[row_idx] if replay_signals is not None else flow_vel
 		last_orig = orig
 		last_deff = deff
 		last_heading = float(sim.state.heading)
-		last_flow_vel = flow_vel
+		last_signal_xy = signal_xy
 		t = float(sim.time)
 		if save_file is not None and t + 1e-12 >= next_save_t:
 			sampled_frames.append(
@@ -2191,12 +2205,12 @@ def _run_headless_replay_mode(
 					sim.state.position.copy(),
 					sim.state.velocity.copy(),
 					float(sim.state.heading),
-					flow_vel.copy(),
+					signal_xy.copy(),
 				)
 			)
 			next_save_t += save_dt
 
-	if save_file is not None and last_orig is not None and last_deff is not None and last_heading is not None and last_flow_vel is not None:
+	if save_file is not None and last_orig is not None and last_deff is not None and last_heading is not None and last_signal_xy is not None:
 		if not sampled_frames or sampled_frames[-1][0] < sim.time - 1e-12:
 			sampled_frames.append(
 				(
@@ -2206,7 +2220,7 @@ def _run_headless_replay_mode(
 					sim.state.position.copy(),
 					sim.state.velocity.copy(),
 					last_heading,
-					last_flow_vel.copy(),
+					last_signal_xy.copy(),
 				)
 			)
 		_save_headless_animation(
@@ -2216,6 +2230,7 @@ def _run_headless_replay_mode(
 			fps=save_fps,
 			object_traj_xy=object_traj_xy,
 			save_dpi=save_dpi,
+			signals_are_overlay=(replay_signals is not None),
 		)
 
 	print(
@@ -3523,6 +3538,7 @@ def run_simulation(
 			_run_headless_replay_mode(
 				sim,
 				replay_txyvv=replay_txyvv,
+				replay_signals=replay_signals,
 				save_file=save_file,
 				save_fps=save_fps,
 				save_dpi=save_dpi,
