@@ -23,8 +23,9 @@ def _expand_limits(vmin: float, vmax: float, pad: float = 0.08) -> tuple[float, 
 class SignalHistoryView:
 	"""Compact per-whisker signal history panel with shared scaling.
 
-	Each row corresponds to one whisker. Left y-axis shows lift (vy), right y-axis
-	shows drag (vx). Limits are shared across whiskers per signal channel.
+	Each row corresponds to one whisker. By default, both lift (vy) and drag (vx)
+	are plotted on the left y-axis. Set ``separate_drag_axis=True`` to restore
+	dual-axis plotting (left=lift, right=drag). Limits are shared across whiskers.
 	"""
 
 	num_whiskers: int
@@ -36,6 +37,7 @@ class SignalHistoryView:
 	drag_color: str = "tab:orange"
 	line_width: float = 1.1
 	_alpha: float = 0.95
+	separate_drag_axis: bool = False
 
 	time_hist: list[float] = field(default_factory=list, init=False)
 	lift_hist: list[np.ndarray] = field(default_factory=list, init=False)
@@ -43,7 +45,7 @@ class SignalHistoryView:
 
 	fig: Figure | None = field(default=None, init=False)
 	axes_left: list[Axes] = field(default_factory=list, init=False)
-	axes_right: list[Axes] = field(default_factory=list, init=False)
+	axes_right: list[Axes | None] = field(default_factory=list, init=False)
 	lift_lines: list[Line2D] = field(default_factory=list, init=False)
 	drag_lines: list[Line2D] = field(default_factory=list, init=False)
 	row_text: list = field(default_factory=list, init=False)
@@ -73,30 +75,36 @@ class SignalHistoryView:
 			ax_l = fig.add_subplot(sub[row, 0], sharex=shared_x)
 			if shared_x is None:
 				shared_x = ax_l
-			ax_r = ax_l.twinx()
+			ax_r = ax_l.twinx() if self.separate_drag_axis else None
 
 			(ln_l,) = ax_l.plot([], [], color=self.lift_color, lw=self.line_width, alpha=self._alpha)
-			(ln_r,) = ax_r.plot([], [], color=self.drag_color, lw=self.line_width, alpha=self._alpha)
+			(ln_r,) = ax_l.plot([], [], color=self.drag_color, lw=self.line_width, alpha=self._alpha)
 			ln_l.set_animated(True)
 			ln_r.set_animated(True)
 
 			ax_l.spines["top"].set_visible(False)
-			ax_r.spines["top"].set_visible(False)
 			ax_l.spines["right"].set_visible(False)
-			ax_r.spines["left"].set_visible(False)
+			if ax_r is not None:
+				ax_r.spines["top"].set_visible(False)
+				ax_r.spines["left"].set_visible(False)
 			ax_l.grid(True, which="major", axis="both", color="0.85", lw=0.6, alpha=0.8)
 
 			if idx != 0:
 				ax_l.tick_params(axis="x", labelbottom=False)
 			ax_l.tick_params(axis="y", labelsize=7, pad=1)
-			ax_r.tick_params(axis="y", labelsize=7, pad=1)
+			if ax_r is not None:
+				ax_r.tick_params(axis="y", labelsize=7, pad=1)
 
 			if idx == self.num_whiskers // 2:
-				ax_l.set_ylabel(self.left_label, fontsize=8, color=self.lift_color, labelpad=2)
-				ax_r.set_ylabel(self.right_label, fontsize=8, color=self.drag_color, labelpad=2)
+				if ax_r is None:
+					ax_l.set_ylabel(f"{self.left_label} / {self.right_label}", fontsize=8, color="0.25", labelpad=2)
+				else:
+					ax_l.set_ylabel(self.left_label, fontsize=8, color=self.lift_color, labelpad=2)
+					ax_r.set_ylabel(self.right_label, fontsize=8, color=self.drag_color, labelpad=2)
 			else:
 				ax_l.set_ylabel("")
-				ax_r.set_ylabel("")
+				if ax_r is not None:
+					ax_r.set_ylabel("")
 
 			label = ax_l.text(
 				0.01,
@@ -178,15 +186,26 @@ class SignalHistoryView:
 		lift = np.asarray(self.lift_hist, dtype=float)
 		drag = np.asarray(self.drag_hist, dtype=float)
 
-		lift_lim = self.fixed_lift_lim or _expand_limits(float(np.min(lift)), float(np.max(lift)))
-		drag_lim = self.fixed_drag_lim or _expand_limits(float(np.min(drag)), float(np.max(drag)))
+		if self.separate_drag_axis:
+			lift_lim = self.fixed_lift_lim or _expand_limits(float(np.min(lift)), float(np.max(lift)))
+			drag_lim = self.fixed_drag_lim or _expand_limits(float(np.min(drag)), float(np.max(drag)))
+		else:
+			shared_lo = float(min(np.min(lift), np.min(drag)))
+			shared_hi = float(max(np.max(lift), np.max(drag)))
+			if self.fixed_lift_lim is not None and self.fixed_drag_lim is not None:
+				shared_lo = min(self.fixed_lift_lim[0], self.fixed_drag_lim[0])
+				shared_hi = max(self.fixed_lift_lim[1], self.fixed_drag_lim[1])
+			lift_lim = _expand_limits(shared_lo, shared_hi, pad=0.0)
+			drag_lim = lift_lim
 
 		for idx in range(self.num_whiskers):
 			self.lift_lines[idx].set_data(t, lift[:, idx])
 			self.drag_lines[idx].set_data(t, drag[:, idx])
 			self.axes_left[idx].set_xlim(float(t[0]), float(t[-1]) + 1e-9)
 			self.axes_left[idx].set_ylim(*lift_lim)
-			self.axes_right[idx].set_ylim(*drag_lim)
+			right_ax = self.axes_right[idx]
+			if right_ax is not None:
+				right_ax.set_ylim(*drag_lim)
 
 		self.set_cursor_index(len(t) - 1)
 
