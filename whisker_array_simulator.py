@@ -1585,9 +1585,10 @@ def _save_headless_animation(
 
 	def _update(frame_idx: int):
 		t, orig, deff, center, array_vel, heading_rad, _signal_xy = sampled_frames[frame_idx]
-		flow_idx = sim.flow._frame_index(t=t, flow_dt=sim.config.flow_dt)
+		t_flow = t + sim.config.flow_time_delay
+		flow_idx = sim.flow._frame_index(t=t_flow, flow_dt=sim.config.flow_dt)
 		f = sim.flow.get_frame_by_index(flow_idx)
-		_decay = sim.flow._decay_factor(t, sim.config.flow_dt)
+		_decay = sim.flow._decay_factor(t_flow, sim.config.flow_dt)
 		bg.set_data(f.vorticity[::vs, ::vs].T * _decay)
 		flow_q.set_UVC(f.u[::qstep, ::qstep].T * _decay, f.v[::qstep, ::qstep].T * _decay)
 		angle_deg = float(np.degrees(heading_rad))
@@ -1842,14 +1843,15 @@ def _run_review_mode(
 	def _render_frame(frame_idx: int) -> None:
 		idx = int(np.clip(frame_idx, 0, n_frames - 1))
 		t = float(frame_times[idx])
+		t_flow = t + sim.config.flow_time_delay
 		orig = frame_orig[idx]
 		deff = frame_deff[idx]
 		center = frame_centers[idx]
 		array_vel = frame_array_vel[idx]
 		heading_rad = float(np.arctan2(array_vel[1], array_vel[0])) if float(np.hypot(array_vel[0], array_vel[1])) > 1e-9 else 0.0
-		flow_idx = sim.flow._frame_index(t=t, flow_dt=sim.config.flow_dt)
-		f = sim.flow.frames[flow_idx]
-		decay = sim.flow._decay_factor(t, sim.config.flow_dt)
+		flow_idx = sim.flow._frame_index(t=t_flow, flow_dt=sim.config.flow_dt)
+		f = sim.flow.get_frame_by_index(flow_idx)
+		decay = sim.flow._decay_factor(t_flow, sim.config.flow_dt)
 		bg.set_data(f.vorticity[::vs, ::vs].T * decay)
 		flow_q.set_UVC(f.u[::qstep, ::qstep].T * decay, f.v[::qstep, ::qstep].T * decay)
 		angle_deg = float(np.degrees(heading_rad))
