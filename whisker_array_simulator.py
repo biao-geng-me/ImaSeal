@@ -703,6 +703,42 @@ class FlowFieldSequence:
 	_h5_cache_limit: int = 3
 
 	@staticmethod
+	def _parse_h5_accuracy_value(path: Path) -> float:
+		"""Parse numeric accuracy token from vel_*.h5 name; lower means higher accuracy."""
+		m = re.match(r"^vel_(.+)\.h(?:df)?5$", path.name, flags=re.IGNORECASE)
+		if m is None:
+			return float("inf")
+		token = m.group(1).strip()
+		try:
+			val = float(token)
+		except Exception:
+			return float("inf")
+		return abs(val)
+
+	@staticmethod
+	def _rank_h5_candidates(paths: list[Path]) -> list[Path]:
+		"""Sort HDF5 candidates by vel_* accuracy then filename as deterministic tiebreaker."""
+		def _key(p: Path) -> tuple[int, float, str]:
+			acc = FlowFieldSequence._parse_h5_accuracy_value(p)
+			is_vel_named = p.name.lower().startswith("vel_")
+			return (0 if is_vel_named else 1, acc, p.name.lower())
+
+		return sorted(paths, key=_key)
+
+	@staticmethod
+	def _discover_h5_candidates(root: Path) -> list[Path]:
+		"""Return ranked HDF5 files under a path folder, prioritizing vel_*.h5 highest-accuracy files."""
+		if not root.is_dir():
+			return []
+		candidates = [
+			*root.glob("vel_*.h5"),
+			*root.glob("vel_*.hdf5"),
+		]
+		if not candidates:
+			return []
+		return FlowFieldSequence._rank_h5_candidates(sorted(set(candidates)))
+
+	@staticmethod
 	def _load_frames_from_hdf5(h5_path: str | Path, *, last_only: bool = False) -> list[FlowFrame2D]:
 		"""Load flow frame(s) from an HDF5 file written by plt_to_hdf5.py."""
 		try:
@@ -889,13 +925,49 @@ class FlowFieldSequence:
 
 	@staticmethod
 	def from_last_frame(data_path: str | Path, coord_scale: float = 1e-3) -> "FlowFieldSequence":
-		"""Load a static flow field from last Q.*.plt or from the last frame in a .h5 file."""
+		"""Load static flow from a single frame.
+
+		Priority:
+		1) best-ranked vel_*.h5/hdf5 frame (last-only)
+		2) last Q.*.plt frame
+		Raises when neither source can be loaded.
+		"""
 		root = Path(data_path)
 		_t0 = perf_counter()
 		if root.is_file() and root.suffix.lower() in {".h5", ".hdf5"}:
 			frames = FlowFieldSequence._load_frames_from_hdf5(root, last_only=True)
 			print(f"[flow] loaded single frame from HDF5: {root.name} ({perf_counter() - _t0:.3f} s)")
 			return FlowFieldSequence(frames=frames, coord_scale=coord_scale)
+
+		if root.is_dir():
+			errors: list[str] = []
+			for h5_path in FlowFieldSequence._discover_h5_candidates(root):
+				try:
+					frames = FlowFieldSequence._load_frames_from_hdf5(h5_path, last_only=True)
+					print(f"[flow] loaded single frame from HDF5: {h5_path.name} ({perf_counter() - _t0:.3f} s)")
+					return FlowFieldSequence(frames=frames, coord_scale=coord_scale)
+				except Exception as exc:
+					errors.append(f"{h5_path.name}: {exc}")
+
+			files = sorted(root.glob("Q.*.plt"))
+			if files:
+				fp = files[-1]
+				parsed = read_plt75(fp)
+				zone = parsed.zones[0]
+				xc = _extract_2d(zone, "xc")
+				yc = _extract_2d(zone, "yc")
+				u = _extract_2d(zone, "u")
+				v = _extract_2d(zone, "v")
+				stored_w = _maybe_extract_zone_vorticity(zone)
+				x = np.asarray(xc[:, 0], dtype=float)
+				y = np.asarray(yc[0, :], dtype=float)
+				w = _compute_or_reuse_vorticity(x, y, u, v, stored_vorticity=stored_w)
+				frame = FlowFrame2D(name=fp.name, x=x, y=y, u=u, v=v, vorticity=w)
+				print(f"[flow] loaded single frame: {fp.name} ({perf_counter() - _t0:.3f} s)")
+				return FlowFieldSequence(frames=[frame], coord_scale=coord_scale)
+
+			err_text = "; ".join(errors) if errors else "no vel_*.h5/hdf5 candidates"
+			raise ValueError(f"No loadable flow source in {root}. HDF5 status: {err_text}; PLT status: no Q.*.plt files found")
 
 		files = sorted(root.glob("Q.*.plt"))
 		if not files:
@@ -946,9 +1018,40 @@ class FlowFieldSequence:
 			)
 			print(f"[flow] loaded {flow.nframes} frame(s) from '{data_path}' ({perf_counter() - _t0:.3f} s)")
 			return flow
-		else:
-			frames = load_flow_frames(data_path)
+
+		if root.is_dir():
+			errors: list[str] = []
+			for h5_path in FlowFieldSequence._discover_h5_candidates(root):
+				try:
+					hf, u_ds, v_ds, w_ds, x, y, nframes = FlowFieldSequence._open_hdf5_lazy(h5_path)
+					flow = FlowFieldSequence(
+						frames=[],
+						coord_scale=coord_scale,
+						decay_half_life=decay_half_life,
+						_h5_handle=hf,
+						_h5_u=u_ds,
+						_h5_v=v_ds,
+						_h5_w=w_ds,
+						_h5_x=x,
+						_h5_y=y,
+						_h5_nframes=nframes,
+					)
+					print(
+						f"[flow] loaded {flow.nframes} frame(s) from '{h5_path}' "
+						f"({perf_counter() - _t0:.3f} s)"
+					)
+					return flow
+				except Exception as exc:
+					errors.append(f"{h5_path.name}: {exc}")
+
+		frames = load_flow_frames(data_path)
 		if not frames:
+			if root.is_dir():
+				err_text = "; ".join(errors) if errors else "no vel_*.h5/hdf5 candidates"
+				raise ValueError(
+					f"No loadable flow source in {root}. HDF5 status: {err_text}; "
+					"PLT status: no Q.*.plt frames found"
+				)
 			raise ValueError("No flow frames found")
 		print(f"[flow] loaded {len(frames)} frame(s) from '{data_path}' ({perf_counter() - _t0:.3f} s)")
 
@@ -1637,7 +1740,7 @@ def _run_review_mode(
 	ax.set_xlabel("x (m)")
 	ax.set_ylabel("y (m)")
 
-	f0 = sim.flow.frames[0]
+	f0 = sim.flow.get_frame_by_index(0)
 	vs = 8
 	qstep = 24
 	s = sim.flow.coord_scale
@@ -2168,7 +2271,7 @@ def _load_excluded_path_ids(exclude_file: Path | None) -> set[int]:
 
 
 def _discover_numbered_flow_paths(root: Path, excluded_ids: set[int] | None = None) -> list[Path]:
-	"""Find and numerically sort child folders matching path<number> with Q.*.plt files."""
+	"""Find path<number> folders that contain either vel_*.h5/hdf5 or Q.*.plt data."""
 	if not root.is_dir():
 		return []
 	excluded_ids = excluded_ids if excluded_ids is not None else set()
@@ -2183,7 +2286,9 @@ def _discover_numbered_flow_paths(root: Path, excluded_ids: set[int] | None = No
 			continue
 		if idx in excluded_ids:
 			continue
-		if any(child.glob("Q.*.plt")):
+		has_h5 = any(child.glob("vel_*.h5")) or any(child.glob("vel_*.hdf5"))
+		has_plt = any(child.glob("Q.*.plt"))
+		if has_h5 or has_plt:
 			items.append((idx, child))
 	items.sort(key=lambda it: it[0])
 	return [p for _, p in items]
